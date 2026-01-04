@@ -1,0 +1,4188 @@
+//
+// fasterbasic_lua_codegen.cpp
+// FasterBASIC - IR to Lua Code Generator Implementation
+//
+
+#include "fasterbasic_lua_codegen.h"
+#include "../runtime/ConstantsManager.h"
+#include "modular_commands.h"
+#include <chrono>
+#include <iostream>
+#include <iomanip>
+#include <sstream>
+#include <stdexcept>
+#include <unordered_set>
+#include <algorithm>
+#include <numeric>
+
+namespace FasterBASIC {
+
+// =============================================================================
+// LuaCodeGenStats Implementation
+// =============================================================================
+
+void LuaCodeGenStats::print() const {
+    std::cout << "=== Lua Code Generation Stats ===" << std::endl;
+    std::cout << "IR Instructions: " << irInstructions << std::endl;
+    std::cout << "Lua Lines Generated: " << linesGenerated << std::endl;
+    std::cout << "Variables: " << variablesUsed << std::endl;
+    std::cout << "Arrays: " << arraysUsed << std::endl;
+    std::cout << "Labels: " << labelsGenerated << std::endl;
+    std::cout << "Generation Time: " << generationTimeMs << " ms" << std::endl;
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+// Mangle BASIC identifier names with type suffixes to be Lua-compatible
+static std::string mangleName(const std::string& name) {
+    if (name.empty()) return name;
+
+    char suffix = name.back();
+    std::string base = name;
+
+    switch (suffix) {
+        case '$':
+            base.pop_back();
+            return base + "_STRING";
+        case '%':
+            base.pop_back();
+            return base + "_INT";
+        case '#':
+            base.pop_back();
+            return base + "_DOUBLE";
+        case '!':
+            base.pop_back();
+            return base + "_FLOAT";
+        case '&':
+            base.pop_back();
+            return base + "_LONG";
+        default:
+            return name;
+    }
+}
+
+// =============================================================================
+// LuaCodeGenerator Implementation
+// =============================================================================
+
+LuaCodeGenerator::LuaCodeGenerator()
+    : m_usesConstants(false) {
+}
+
+LuaCodeGenerator::LuaCodeGenerator(const LuaCodeGenConfig& config)
+    : m_config(config)
+    , m_usesConstants(false) {
+}
+
+LuaCodeGenerator::~LuaCodeGenerator() {
+}
+
+std::string LuaCodeGenerator::generate(const IRCode& irCode) {
+    auto startTime = std::chrono::high_resolution_clock::now();
+
+    // Reset state
+    m_output.str("");
+    m_output.clear();
+    m_stats = LuaCodeGenStats{};
+    m_variables.clear();
+    m_arrays.clear();
+    m_labels.clear();
+    m_stringTable.clear();
+    m_exprStack.clear();
+    m_labelAddresses.clear();
+    m_forLoopStack.clear();
+    m_doLoopStack.clear();
+    m_tempVarCounter = 0;
+    m_gosubReturnCounter = 0;
+    m_gosubReturnIds.clear();
+    m_exprOptimizer.reset();
+    m_useExpressionMode = true;
+    m_indentOffset = 0;
+    m_arrayInfo.clear();
+    m_functionDefs.clear();
+    m_currentFunction = nullptr;
+    m_lastEmittedOpcode = IROpcode::NOP;
+    m_arrayBase = irCode.arrayBase;  // Copy OPTION BASE setting from IR
+    m_unicodeMode = irCode.unicodeMode;  // Copy OPTION UNICODE setting from IR
+    m_errorTracking = irCode.errorTracking;  // Copy OPTION ERROR setting from IR
+    m_lastEmittedLine = 0;  // Track last emitted line number
+    m_constantsManager = irCode.constantsManager;  // Copy constants manager pointer for inlining
+    m_variableAccess.clear();
+    m_hotVariables.clear();
+    m_coldVariableIDs.clear();
+    m_usedLocalSlots = 0;
+
+    m_stats.irInstructions = irCode.instructions.size();
+
+    // First pass: collect symbols and resolve labels
+    resolveLabels(irCode);
+
+    // Second pass: collect function/sub definitions
+    collectFunctionDefinitions(irCode);
+
+    // Third pass: analyze variable access patterns for hot/cold caching
+    if (m_config.useVariableCache) {
+        analyzeVariableAccess(irCode);
+        selectHotVariables();
+    }
+
+    // Generate code sections
+    emitHeader();
+    emitVariableDeclarations();
+    emitArrayDeclarations();
+    emitDataSection(irCode);
+    emitUserFunctions(irCode);
+    emitMainFunction(irCode);
+    emitFooter();
+
+    auto endTime = std::chrono::high_resolution_clock::now();
+    m_stats.generationTimeMs = std::chrono::duration<double, std::milli>(endTime - startTime).count();
+
+    return m_output.str();
+}
+
+// =============================================================================
+// Header/Footer Generation
+// =============================================================================
+
+void LuaCodeGenerator::emitHeader() {
+    emitLine("-- FasterBASIC Generated Lua Code");
+    emitLine("-- Optimized for LuaJIT trace compilation");
+    emitLine("");
+
+    if (m_config.useLuaJITHints) {
+        emitLine("-- LuaJIT optimization hints");
+        emitLine("local ffi = require('ffi')");
+        emitLine("");
+
+        emitLine("-- Bitwise operations (check if already injected by runtime)");
+        emitLine("local bitwise = bitwise or require('runtime.bitwise_ffi_bindings')");
+        emitLine("");
+    }
+
+    // Constants are now inlined directly, no runtime needed
+
+    // Unicode support if OPTION UNICODE is enabled
+    if (m_unicodeMode) {
+        emitLine("-- Unicode runtime (check if already injected by runtime, else load via FFI)");
+        emitLine("if not unicode then");
+        emitLine("    local unicode_ok, unicode_mod = pcall(require, 'unicode_ffi_bindings')");
+        emitLine("    if not unicode_ok or not unicode_mod or not unicode_mod.available then");
+        emitLine("        error('OPTION UNICODE requires unicode module (embedded or FFI)')");
+        emitLine("    end");
+        emitLine("    unicode = unicode_mod");
+        emitLine("end");
+        emitLine("");
+    }
+
+    emitLine("-- Runtime support functions");
+    emitLine("-- basic_print and basic_console are now C functions registered at runtime");
+    emitLine("");
+
+    emitLine("local function basic_input()");
+    emitLine("    return tonumber(io.read()) or 0");
+    emitLine("end");
+    emitLine("");
+
+    emitLine("local function basic_rnd()");
+    emitLine("    return math.random()");
+    emitLine("end");
+    emitLine("");
+
+    emitLine("-- MID$ assignment function");
+    emitLine("-- Simulates: MID$(original$, pos, len) = replacement$");
+
+    if (m_unicodeMode) {
+        emitLine("-- Unicode mode: strings are tables of codepoints (mutable!)");
+        emitLine("-- We can do TRUE in-place modification for better performance");
+        emitLine("local function basic_mid_assign(original, pos, len, replacement)");
+        emitLine("    -- Handle edge cases");
+        emitLine("    if pos < 1 then pos = 1 end");
+        emitLine("    if len < 1 then return original end");
+        emitLine("    ");
+        emitLine("    -- If position is beyond the string, return original unchanged");
+        emitLine("    if pos > #original then return original end");
+        emitLine("    ");
+        emitLine("    -- Modify the table IN PLACE (tables are mutable!)");
+        emitLine("    local replaceLen = math.min(len, #replacement)");
+        emitLine("    for i = 1, replaceLen do");
+        emitLine("        original[pos + i - 1] = replacement[i]");
+        emitLine("    end");
+        emitLine("    ");
+        emitLine("    -- Return the modified table (same reference)");
+        emitLine("    return original");
+        emitLine("end");
+    } else {
+        emitLine("-- Standard mode: strings are Lua strings (immutable)");
+        emitLine("local function basic_mid_assign(original, pos, len, replacement)");
+        emitLine("    -- Handle edge cases");
+        emitLine("    if pos < 1 then pos = 1 end");
+        emitLine("    if len < 1 then return original end");
+        emitLine("    ");
+        emitLine("    -- Convert 1-based BASIC position to Lua position");
+        emitLine("    local startPos = pos");
+        emitLine("    ");
+        emitLine("    -- If position is beyond the string, return original unchanged");
+        emitLine("    if startPos > #original then return original end");
+        emitLine("    ");
+        emitLine("    -- Build the result string");
+        emitLine("    local result = ''");
+        emitLine("    ");
+        emitLine("    -- Part 1: Copy everything before the replacement position");
+        emitLine("    if startPos > 1 then");
+        emitLine("        result = original:sub(1, startPos - 1)");
+        emitLine("    end");
+        emitLine("    ");
+        emitLine("    -- Part 2: Replace characters (up to min of len or replacement length)");
+        emitLine("    local replaceLen = math.min(len, #replacement)");
+        emitLine("    result = result .. replacement:sub(1, replaceLen)");
+        emitLine("    ");
+        emitLine("    -- Part 3: Keep unreplaced characters in the target range");
+        emitLine("    if replaceLen < len then");
+        emitLine("        local keepStart = startPos + replaceLen");
+        emitLine("        local keepEnd = math.min(startPos + len - 1, #original)");
+        emitLine("        if keepStart <= keepEnd then");
+        emitLine("            result = result .. original:sub(keepStart, keepEnd)");
+        emitLine("        end");
+        emitLine("    end");
+        emitLine("    ");
+        emitLine("    -- Part 4: Copy everything after the target range");
+        emitLine("    local endPos = startPos + len");
+        emitLine("    if endPos <= #original then");
+        emitLine("        result = result .. original:sub(endPos)");
+        emitLine("    end");
+        emitLine("    ");
+        emitLine("    return result");
+        emitLine("end");
+    }
+    emitLine("");
+
+    emitLine("-- PRINT USING formatter");
+    emitLine("local function basic_print_using(format, ...)");
+    emitLine("    local values = {...}");
+    emitLine("    local result = ''");
+    emitLine("    local valueIndex = 1");
+    emitLine("    local i = 1");
+    emitLine("    ");
+    emitLine("    while i <= #format do");
+    emitLine("        local ch = format:sub(i, i)");
+    emitLine("        ");
+    emitLine("        if ch == '&' then");
+    emitLine("            -- Whole string");
+    emitLine("            if valueIndex <= #values then");
+    emitLine("                result = result .. tostring(values[valueIndex])");
+    emitLine("                valueIndex = valueIndex + 1");
+    emitLine("            end");
+    emitLine("            i = i + 1");
+    emitLine("            ");
+    emitLine("        elseif ch == '!' then");
+    emitLine("            -- First character only");
+    emitLine("            if valueIndex <= #values then");
+    emitLine("                local s = tostring(values[valueIndex])");
+    emitLine("                result = result .. s:sub(1, 1)");
+    emitLine("                valueIndex = valueIndex + 1");
+    emitLine("            end");
+    emitLine("            i = i + 1");
+    emitLine("            ");
+    emitLine("        elseif ch == '\\\\' then");
+    emitLine("            -- Fixed width string: \\  \\");
+    emitLine("            local endSlash = format:find('\\\\', i + 1)");
+    emitLine("            if endSlash then");
+    emitLine("                local width = endSlash - i + 1");
+    emitLine("                if valueIndex <= #values then");
+    emitLine("                    local s = tostring(values[valueIndex])");
+    emitLine("                    if #s > width then");
+    emitLine("                        result = result .. s:sub(1, width)");
+    emitLine("                    else");
+    emitLine("                        result = result .. s .. string.rep(' ', width - #s)");
+    emitLine("                    end");
+    emitLine("                    valueIndex = valueIndex + 1");
+    emitLine("                end");
+    emitLine("                i = endSlash + 1");
+    emitLine("            else");
+    emitLine("                result = result .. ch");
+    emitLine("                i = i + 1");
+    emitLine("            end");
+    emitLine("            ");
+    emitLine("        elseif ch == '#' then");
+    emitLine("            -- Numeric format: ###.##");
+    emitLine("            local beforeDecimal = 0");
+    emitLine("            local afterDecimal = 0");
+    emitLine("            local hasDecimal = false");
+    emitLine("            local hasComma = false");
+    emitLine("            ");
+    emitLine("            while i <= #format and (format:sub(i,i) == '#' or format:sub(i,i) == '.' or format:sub(i,i) == ',') do");
+    emitLine("                if format:sub(i,i) == '.' then");
+    emitLine("                    hasDecimal = true");
+    emitLine("                elseif format:sub(i,i) == ',' then");
+    emitLine("                    hasComma = true");
+    emitLine("                else");
+    emitLine("                    if hasDecimal then");
+    emitLine("                        afterDecimal = afterDecimal + 1");
+    emitLine("                    else");
+    emitLine("                        beforeDecimal = beforeDecimal + 1");
+    emitLine("                    end");
+    emitLine("                end");
+    emitLine("                i = i + 1");
+    emitLine("            end");
+    emitLine("            ");
+    emitLine("            if valueIndex <= #values then");
+    emitLine("                local num = tonumber(values[valueIndex]) or 0");
+    emitLine("                local formatted");
+    emitLine("                if hasDecimal then");
+    emitLine("                    formatted = string.format('%.'..afterDecimal..'f', num)");
+    emitLine("                else");
+    emitLine("                    formatted = string.format('%d', math.floor(num))");
+    emitLine("                end");
+    emitLine("                ");
+    emitLine("                -- Add thousands separators if requested");
+    emitLine("                if hasComma and not hasDecimal then");
+    emitLine("                    local k");
+    emitLine("                    formatted, k = string.gsub(formatted, '^(-?%d+)(%d%d%d)', '%1,%2')");
+    emitLine("                    while k > 0 do");
+    emitLine("                        formatted, k = string.gsub(formatted, '^(-?%d+),(%d%d%d,)', '%1,%2')");
+    emitLine("                    end");
+    emitLine("                end");
+    emitLine("                ");
+    emitLine("                -- Right-align in field");
+    emitLine("                local totalWidth = beforeDecimal + (hasDecimal and 1 + afterDecimal or 0)");
+    emitLine("                if #formatted < totalWidth then");
+    emitLine("                    result = result .. string.rep(' ', totalWidth - #formatted)");
+    emitLine("                end");
+    emitLine("                result = result .. formatted");
+    emitLine("                valueIndex = valueIndex + 1");
+    emitLine("            end");
+    emitLine("            ");
+    emitLine("        else");
+    emitLine("            -- Literal character");
+    emitLine("            result = result .. ch");
+    emitLine("            i = i + 1");
+    emitLine("        end");
+    emitLine("    end");
+    emitLine("    ");
+    emitLine("    return result");
+    emitLine("end");
+    emitLine("");
+
+    emitLine("-- Stack for expression evaluation");
+    emitLine("local stack = {}");
+    emitLine("local sp = 0");
+    emitLine("");
+
+    emitLine("local function push(v)");
+    emitLine("    sp = sp + 1");
+    emitLine("    stack[sp] = v");
+    emitLine("end");
+    emitLine("");
+
+    emitLine("local function pop()");
+    emitLine("    local v = stack[sp]");
+    emitLine("    sp = sp - 1");
+    emitLine("    return v");
+    emitLine("end");
+    emitLine("");
+
+    emitLine("-- Constants table");
+    emitLine("local constants = {}");
+    emitLine("");
+    emitLine("-- Temp variables for operations (declared at function scope to avoid goto issues)");
+    emitLine("local _on_temp = 0  -- For ON GOTO/GOSUB/CALL selector");
+    emitLine("local a, b, done, dim, idx, val, ret_label");
+    emitLine("");
+    emitLine("-- Reusable variables for multi-dimensional arrays (reduces local count)");
+    emitLine("local idx0, idx1, idx2, idx3, idx4, idx5, idx6, idx7, idx8, idx9");
+    emitLine("local dim0, dim1, dim2, dim3, dim4, dim5, dim6, dim7, dim8, dim9");
+    emitLine("");
+    emitLine("-- Reusable FOR loop control variables (reduces local count)");
+    emitLine("local for_start, for_end, for_step");
+    emitLine("");
+    emitLine("-- Cursor position for AT/LOCATE commands");
+    emitLine("local _cursor_x, _cursor_y = 0, 0");
+    emitLine("");
+
+    // Error tracking variable (if enabled)
+    if (m_errorTracking) {
+        emitLine("-- BASIC line number tracker (for error reporting)");
+        emitLine("-- Enable with: OPTION ERROR");
+        emitLine("local _LINE = 0");
+        emitLine("");
+    }
+
+    // Emit variable table if using hot/cold caching
+    if (m_config.useVariableCache) {
+        emitVariableTableDeclaration();
+    }
+    
+    // Emit parameter pool for modular commands (reduces local variable usage)
+    emitParameterPoolDeclaration();
+}
+
+void LuaCodeGenerator::emitFooter() {
+    emitLine("");
+    emitLine("-- Entry point with error handling");
+    emitLine("local success, err = pcall(main)");
+    emitLine("if not success then");
+    if (m_errorTracking) {
+        emitLine("    if _LINE > 0 then");
+        emitLine("        io.stderr:write(\"Runtime error at BASIC line \" .. _LINE .. \": \" .. tostring(err) .. \"\\n\")");
+        emitLine("    else");
+        emitLine("        io.stderr:write(\"Runtime error: \" .. tostring(err) .. \"\\n\")");
+        emitLine("    end");
+        emitLine("    error(err)");
+    } else {
+        emitLine("    error(err)");
+    }
+    emitLine("end");
+}
+
+void LuaCodeGenerator::emitVariableDeclarations() {
+    if (m_variables.empty()) return;
+
+    emitLine("-- Variable declarations");
+    for (const auto& [name, idx] : m_variables) {
+        emitLine("local " + getVarName(name) + " = 0");
+    }
+    emitLine("");
+
+    m_stats.variablesUsed = m_variables.size();
+}
+
+void LuaCodeGenerator::emitArrayDeclarations() {
+    if (m_arrays.empty()) return;
+
+    emitLine("-- Array declarations");
+    for (const auto& [name, idx] : m_arrays) {
+        emitLine("local " + getArrayName(name));
+    }
+    emitLine("");
+
+    m_stats.arraysUsed = m_arrays.size();
+}
+
+void LuaCodeGenerator::emitDataSection(const IRCode& irCode) {
+    // DATA is now stored in C++ DataManager, not in Lua
+    // The DataManager will be initialized by FBRunner3 before script execution
+    // So we don't need to emit anything here
+    (void)irCode;
+}
+
+void LuaCodeGenerator::emitUserFunctions(const IRCode& irCode) {
+    // Emit all FUNCTION and SUB definitions at module level
+    emitLine("-- User-defined functions and subroutines");
+
+    bool inFunctionDef = false;
+    size_t funcStartIndex = 0;
+
+    for (size_t i = 0; i < irCode.instructions.size(); i++) {
+        const auto& instr = irCode.instructions[i];
+
+        if (instr.opcode == IROpcode::DEFINE_FUNCTION || instr.opcode == IROpcode::DEFINE_SUB) {
+            inFunctionDef = true;
+            funcStartIndex = i;
+            emitFunctionDefinition(instr);
+
+            // Skip param count and param names
+            if (i + 1 < irCode.instructions.size() &&
+                irCode.instructions[i + 1].opcode == IROpcode::PUSH_INT &&
+                std::holds_alternative<int>(irCode.instructions[i + 1].operand1)) {
+                int paramCount = std::get<int>(irCode.instructions[i + 1].operand1);
+                i += 1 + paramCount; // Skip PUSH_INT and all PUSH_STRING param names
+            }
+        } else if (inFunctionDef && (instr.opcode == IROpcode::END_FUNCTION ||
+                                      instr.opcode == IROpcode::END_SUB)) {
+            emitFunctionDefinition(instr);
+            inFunctionDef = false;
+        } else if (inFunctionDef) {
+            // Emit instructions inside the function body
+            emitInstruction(instr, i);
+        }
+    }
+
+    emitLine("");
+}
+
+void LuaCodeGenerator::emitMainFunction(const IRCode& irCode) {
+    emitLine("-- Main program");
+    emitLine("local function main()");
+
+    // First pass: collect all GOSUB target labels (subroutines to convert to functions)
+    std::set<std::string> gosubTargets;
+    std::set<size_t> subroutineInstructions; // Track which instructions are part of subroutines
+    for (size_t i = 0; i < irCode.instructions.size(); i++) {
+        const auto& instr = irCode.instructions[i];
+        if (instr.opcode == IROpcode::CALL_GOSUB) {
+            std::string labelStr;
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                labelStr = std::get<std::string>(instr.operand1);
+            } else if (std::holds_alternative<int>(instr.operand1)) {
+                labelStr = std::to_string(std::get<int>(instr.operand1));
+            }
+            if (!labelStr.empty()) {
+                gosubTargets.insert(labelStr);
+            }
+        } else if (instr.opcode == IROpcode::ON_GOSUB) {
+            // Parse comma-separated label IDs from operand
+            std::string targets;
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                targets = std::get<std::string>(instr.operand1);
+            }
+            if (!targets.empty()) {
+                std::vector<std::string> labelIds;
+                size_t start = 0;
+                size_t pos = targets.find(',');
+                while (pos != std::string::npos) {
+                    labelIds.push_back(targets.substr(start, pos - start));
+                    start = pos + 1;
+                    pos = targets.find(',', start);
+                }
+                labelIds.push_back(targets.substr(start));
+
+                for (const auto& label : labelIds) {
+                    gosubTargets.insert(label);
+                }
+            }
+        }
+    }
+
+    // Second pass: identify which instructions belong to subroutines
+    for (const auto& targetLabel : gosubTargets) {
+        bool inSubroutine = false;
+        for (size_t i = 0; i < irCode.instructions.size(); i++) {
+            const auto& instr = irCode.instructions[i];
+
+            // Check if this is the target label
+            if (instr.opcode == IROpcode::LABEL) {
+                std::string labelStr;
+                if (std::holds_alternative<std::string>(instr.operand1)) {
+                    labelStr = std::get<std::string>(instr.operand1);
+                } else if (std::holds_alternative<int>(instr.operand1)) {
+                    labelStr = std::to_string(std::get<int>(instr.operand1));
+                }
+                if (labelStr == targetLabel) {
+                    inSubroutine = true;
+                    subroutineInstructions.insert(i); // Mark the label
+                    continue;
+                }
+            }
+
+            // If we're in the subroutine, mark instructions
+            if (inSubroutine) {
+                subroutineInstructions.insert(i);
+                if (instr.opcode == IROpcode::RETURN_GOSUB) {
+                    // End of subroutine
+                    break;
+                }
+            }
+        }
+    }
+
+    // Third pass: create table for GOSUB functions (avoids 200-local limit)
+    emitLine("");
+    emitLine("    -- GOSUB subroutines table (avoids local variable limit)");
+    emitLine("    local _gosub = {}");
+    emitLine("");
+
+    // Fourth pass: emit subroutines as table entries
+    for (const auto& targetLabel : gosubTargets) {
+        emitLine("    _gosub." + getLabelName(targetLabel) + " = function()");
+
+        // Find the label in the IR and emit code until RETURN
+        bool inSubroutine = false;
+        for (size_t i = 0; i < irCode.instructions.size(); i++) {
+            const auto& instr = irCode.instructions[i];
+
+            // Check if this is the target label
+            if (instr.opcode == IROpcode::LABEL) {
+                std::string labelStr;
+                if (std::holds_alternative<std::string>(instr.operand1)) {
+                    labelStr = std::get<std::string>(instr.operand1);
+                } else if (std::holds_alternative<int>(instr.operand1)) {
+                    labelStr = std::to_string(std::get<int>(instr.operand1));
+                }
+                if (labelStr == targetLabel) {
+                    inSubroutine = true;
+                    continue; // Don't emit the label itself
+                }
+            }
+
+            // If we're in the subroutine, emit instructions
+            if (inSubroutine) {
+                if (instr.opcode == IROpcode::RETURN_GOSUB) {
+                    // End of subroutine
+                    emitLine("        return");
+                    break;
+                }
+
+                // Emit the instruction with extra indentation for nested function
+                m_indentOffset = 4; // Add 4 spaces for nested function
+                emitInstruction(instr, i);
+                m_indentOffset = 0; // Reset indentation
+            }
+        }
+
+        emitLine("    end");
+        emitLine("");
+    }
+
+    // Generate code for each instruction
+    // Track the next label after FOR_INIT for loop back jumps
+    std::string nextLabelAfterForInit;
+    bool lastWasReturn = false;
+
+    for (size_t i = 0; i < irCode.instructions.size(); i++) {
+        const auto& instr = irCode.instructions[i];
+
+        // Skip instructions that are part of subroutines (already emitted as functions)
+        if (subroutineInstructions.count(i) > 0) {
+            continue;
+        }
+
+        // Skip function/sub definitions - they were already emitted at module level
+        if (instr.opcode == IROpcode::DEFINE_FUNCTION || instr.opcode == IROpcode::DEFINE_SUB) {
+            // Find the corresponding END_FUNCTION/END_SUB and skip to it
+            int depth = 1;
+            size_t j = i + 1;
+
+            // Skip param count and param names
+            if (j < irCode.instructions.size() &&
+                irCode.instructions[j].opcode == IROpcode::PUSH_INT &&
+                std::holds_alternative<int>(irCode.instructions[j].operand1)) {
+                int paramCount = std::get<int>(irCode.instructions[j].operand1);
+                j += 1 + paramCount; // Skip PUSH_INT and all PUSH_STRING param names
+            }
+
+            while (j < irCode.instructions.size() && depth > 0) {
+                if (irCode.instructions[j].opcode == IROpcode::DEFINE_FUNCTION ||
+                    irCode.instructions[j].opcode == IROpcode::DEFINE_SUB) {
+                    depth++;
+                } else if (irCode.instructions[j].opcode == IROpcode::END_FUNCTION ||
+                           irCode.instructions[j].opcode == IROpcode::END_SUB) {
+                    depth--;
+                }
+                j++;
+            }
+            i = j - 1; // -1 because the loop will increment
+            continue;
+        }
+
+        // Use semicolon before unreachable labels (Lua 5.2+ syntax)
+        if (lastWasReturn && instr.opcode == IROpcode::LABEL) {
+            // Don't emit anything, the semicolon will be added by emitLabel
+            lastWasReturn = false;
+        }
+
+        // If this is a LABEL right after FOR_INIT, save it for FOR_NEXT
+        if (instr.opcode == IROpcode::LABEL && !nextLabelAfterForInit.empty()) {
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                nextLabelAfterForInit = std::get<std::string>(instr.operand1);
+            } else if (std::holds_alternative<int>(instr.operand1)) {
+                nextLabelAfterForInit = std::to_string(std::get<int>(instr.operand1));
+            }
+
+            // Store this label in the current loop context
+            if (!m_forLoopStack.empty()) {
+                m_forLoopStack.back().loopBackLabel = nextLabelAfterForInit;
+            }
+            nextLabelAfterForInit.clear();
+        }
+
+        // Mark that we need to capture the next label
+        if (instr.opcode == IROpcode::FOR_INIT) {
+            nextLabelAfterForInit = "pending";
+        }
+
+        emitInstruction(instr, i);
+
+        // Track if we just emitted a return
+        lastWasReturn = (instr.opcode == IROpcode::END || instr.opcode == IROpcode::HALT);
+    }
+
+    emitLine("    ::end_program::");
+
+    emitLine("end");
+    emitLine("");
+
+    // DATA/READ/RESTORE support
+    // Note: basic_read_data(), basic_read_data_string(), and basic_restore()
+    // are provided by C++ bindings in FBTBindings.cpp
+    // The DataManager is initialized with DATA values before script execution
+}
+
+// =============================================================================
+// Label Resolution
+// =============================================================================
+
+void LuaCodeGenerator::resolveLabels(const IRCode& irCode) {
+    for (size_t i = 0; i < irCode.instructions.size(); i++) {
+        const auto& instr = irCode.instructions[i];
+        if (instr.opcode == IROpcode::LABEL) {
+            std::string label;
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                label = std::get<std::string>(instr.operand1);
+            } else if (std::holds_alternative<int>(instr.operand1)) {
+                label = std::to_string(std::get<int>(instr.operand1));
+            }
+            if (!label.empty()) {
+                m_labelAddresses[label] = static_cast<int>(i);
+                m_labels[label] = m_labels.size();
+            }
+        }
+    }
+}
+
+void LuaCodeGenerator::collectFunctionDefinitions(const IRCode& irCode) {
+    // Scan through IR to find DEFINE_FUNCTION and DEFINE_SUB instructions
+    // and collect parameter information
+    for (size_t i = 0; i < irCode.instructions.size(); i++) {
+        const auto& instr = irCode.instructions[i];
+
+        if (instr.opcode == IROpcode::DEFINE_FUNCTION || instr.opcode == IROpcode::DEFINE_SUB) {
+            if (!std::holds_alternative<std::string>(instr.operand1)) continue;
+
+            std::string funcName = std::get<std::string>(instr.operand1);
+            FunctionInfo info;
+            info.name = funcName;
+            info.isFunction = (instr.opcode == IROpcode::DEFINE_FUNCTION);
+            info.startIndex = i;
+
+            // Next instruction should be param count (PUSH_INT)
+            if (i + 1 < irCode.instructions.size()) {
+                const auto& nextInstr = irCode.instructions[i + 1];
+                if (nextInstr.opcode == IROpcode::PUSH_INT && std::holds_alternative<int>(nextInstr.operand1)) {
+                    int paramCount = std::get<int>(nextInstr.operand1);
+
+                    // Following instructions should be param names (PUSH_STRING)
+                    for (int p = 0; p < paramCount && i + 2 + p < irCode.instructions.size(); p++) {
+                        const auto& paramInstr = irCode.instructions[i + 2 + p];
+                        if (paramInstr.opcode == IROpcode::PUSH_STRING &&
+                            std::holds_alternative<std::string>(paramInstr.operand1)) {
+                            info.parameters.push_back(std::get<std::string>(paramInstr.operand1));
+                        }
+                    }
+                }
+            }
+
+            m_functionDefs[funcName] = info;
+        }
+    }
+}
+
+// =============================================================================
+// Instruction Translation
+// =============================================================================
+
+void LuaCodeGenerator::emitInstruction(const IRInstruction& instr, size_t index) {
+    // Emit line number tracking if enabled and line changed
+    if (m_errorTracking && instr.sourceLineNumber > 0 && instr.sourceLineNumber != m_lastEmittedLine) {
+        emitLine("    -- LINE " + std::to_string(instr.sourceLineNumber));
+        emitLine("    _LINE = " + std::to_string(instr.sourceLineNumber));
+        m_lastEmittedLine = instr.sourceLineNumber;
+    }
+
+    if (m_config.emitComments) {
+        emitComment("IR[" + std::to_string(index) + "]");
+    }
+
+    // Save previous opcode before processing current instruction
+    IROpcode previousOpcode = m_lastEmittedOpcode;
+
+    switch (instr.opcode) {
+        // Stack operations
+        case IROpcode::PUSH_INT:
+        case IROpcode::PUSH_DOUBLE:
+        case IROpcode::PUSH_STRING:
+            emitStackOp(instr);
+            break;
+
+        case IROpcode::POP:
+            emitLine("    pop()");
+            break;
+
+        // Arithmetic
+        case IROpcode::ADD:
+        case IROpcode::SUB:
+        case IROpcode::MUL:
+        case IROpcode::DIV:
+        case IROpcode::IDIV:
+        case IROpcode::MOD:
+        case IROpcode::POW:
+        case IROpcode::NEG:
+            emitArithmetic(instr);
+            break;
+
+        // String operations
+        case IROpcode::STR_CONCAT:
+        case IROpcode::UNICODE_CONCAT:
+            emitStringConcat(instr);
+            break;
+
+        // Comparison
+        case IROpcode::EQ:
+        case IROpcode::NE:
+        case IROpcode::LT:
+        case IROpcode::LE:
+        case IROpcode::GT:
+        case IROpcode::GE:
+            emitComparison(instr);
+            break;
+
+        // Logical
+        case IROpcode::AND:
+        case IROpcode::OR:
+        case IROpcode::XOR:
+        case IROpcode::EQV:
+        case IROpcode::IMP:
+        case IROpcode::NOT:
+            emitLogical(instr);
+            break;
+
+        // Variables
+        case IROpcode::LOAD_VAR:
+        case IROpcode::STORE_VAR:
+        case IROpcode::MID_ASSIGN:
+            emitVariable(instr);
+            break;
+
+        // Constants
+        case IROpcode::LOAD_CONST:
+            m_usesConstants = true;  // Track that program uses constants
+            emitConstant(instr);
+            break;
+
+        // Arrays
+        case IROpcode::LOAD_ARRAY:
+        case IROpcode::STORE_ARRAY:
+        case IROpcode::DIM_ARRAY:
+            emitArray(instr);
+            break;
+
+        // Control flow
+        case IROpcode::LABEL:
+        case IROpcode::JUMP:
+        case IROpcode::JUMP_IF_FALSE:
+        case IROpcode::JUMP_IF_TRUE:
+        case IROpcode::CALL_GOSUB:
+        case IROpcode::RETURN_GOSUB:
+        case IROpcode::ON_GOTO:
+        case IROpcode::ON_GOSUB:
+        case IROpcode::ON_CALL:
+        case IROpcode::IF_START:
+        case IROpcode::ELSEIF_START:
+        case IROpcode::ELSE_START:
+        case IROpcode::IF_END:
+            emitControlFlow(instr, index);
+            break;
+
+        // Loops
+        case IROpcode::FOR_INIT:
+        case IROpcode::FOR_CHECK:
+        case IROpcode::FOR_NEXT:
+        case IROpcode::WHILE_START:
+        case IROpcode::WHILE_END:
+        case IROpcode::REPEAT_START:
+        case IROpcode::REPEAT_END:
+        case IROpcode::DO_WHILE_START:
+        case IROpcode::DO_UNTIL_START:
+        case IROpcode::DO_START:
+        case IROpcode::DO_LOOP_WHILE:
+        case IROpcode::DO_LOOP_UNTIL:
+        case IROpcode::DO_LOOP_END:
+            emitLoop(instr);
+            break;
+
+        // I/O
+        case IROpcode::PRINT:
+        case IROpcode::CONSOLE:
+        case IROpcode::PRINT_NEWLINE:
+        case IROpcode::PRINT_USING:
+        case IROpcode::PRINT_AT:
+        case IROpcode::PRINT_AT_USING:
+        case IROpcode::INPUT_AT:
+        case IROpcode::INPUT:
+        case IROpcode::INPUT_PROMPT:
+        case IROpcode::READ_DATA:
+        case IROpcode::RESTORE:
+        case IROpcode::OPEN_FILE:
+        case IROpcode::CLOSE_FILE:
+        case IROpcode::CLOSE_FILE_ALL:
+        case IROpcode::PRINT_FILE:
+        case IROpcode::PRINT_FILE_NEWLINE:
+        case IROpcode::INPUT_FILE:
+        case IROpcode::LINE_INPUT_FILE:
+        case IROpcode::WRITE_FILE:
+            emitIO(instr);
+            break;
+
+        // Built-in functions
+        case IROpcode::CALL_BUILTIN:
+            emitBuiltinFunction(instr);
+            break;
+
+        // User-defined functions and subs
+        case IROpcode::DEFINE_FUNCTION:
+        case IROpcode::DEFINE_SUB:
+        case IROpcode::END_FUNCTION:
+        case IROpcode::END_SUB:
+            emitFunctionDefinition(instr);
+            break;
+
+        case IROpcode::CALL_FUNCTION:
+        case IROpcode::CALL_SUB:
+            emitFunctionCall(instr);
+            break;
+
+        case IROpcode::RETURN_VALUE:
+        case IROpcode::RETURN_VOID:
+            emitReturn(instr);
+            break;
+
+        case IROpcode::EXIT_FOR:
+        case IROpcode::EXIT_DO:
+        case IROpcode::EXIT_WHILE:
+        case IROpcode::EXIT_REPEAT:
+        case IROpcode::EXIT_FUNCTION:
+        case IROpcode::EXIT_SUB:
+            emitExit(instr);
+            break;
+
+        case IROpcode::END:
+        case IROpcode::HALT:
+            emitLine("    goto end_program");
+            break;
+
+        default:
+            if (m_config.emitComments) {
+                emitComment("Unhandled opcode: " + std::to_string(static_cast<int>(instr.opcode)));
+            }
+            break;
+    }
+
+    // Track what opcode was just emitted for unreachable code detection
+    m_lastEmittedOpcode = instr.opcode;
+}
+
+void LuaCodeGenerator::emitStackOp(const IRInstruction& instr) {
+    // Use expression optimizer when possible
+    if (canUseExpressionMode()) {
+        switch (instr.opcode) {
+            case IROpcode::PUSH_INT:
+                if (std::holds_alternative<int>(instr.operand1)) {
+                    m_exprOptimizer.pushLiteral(std::to_string(std::get<int>(instr.operand1)));
+                } else {
+                    m_exprOptimizer.pushLiteral("0");
+                }
+                return;
+
+            case IROpcode::PUSH_DOUBLE:
+                if (std::holds_alternative<double>(instr.operand1)) {
+                    m_exprOptimizer.pushLiteral(std::to_string(std::get<double>(instr.operand1)));
+                } else {
+                    m_exprOptimizer.pushLiteral("0.0");
+                }
+                return;
+
+            case IROpcode::PUSH_STRING:
+                if (std::holds_alternative<std::string>(instr.operand1)) {
+                    m_exprOptimizer.pushLiteral(escapeString(std::get<std::string>(instr.operand1)));
+                } else {
+                    m_exprOptimizer.pushLiteral("''");
+                }
+                return;
+
+            default:
+                break;
+        }
+    }
+
+    // Fallback to stack-based emission
+    switch (instr.opcode) {
+        case IROpcode::PUSH_INT:
+            if (std::holds_alternative<int>(instr.operand1)) {
+                emitLine("    push(" + std::to_string(std::get<int>(instr.operand1)) + ")");
+            } else {
+                emitLine("    push(0)");
+            }
+            break;
+
+        case IROpcode::PUSH_DOUBLE:
+            if (std::holds_alternative<double>(instr.operand1)) {
+                emitLine("    push(" + std::to_string(std::get<double>(instr.operand1)) + ")");
+            } else {
+                emitLine("    push(0.0)");
+            }
+            break;
+
+        case IROpcode::PUSH_STRING:
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                emitLine("    push(" + escapeString(std::get<std::string>(instr.operand1)) + ")");
+            } else {
+                emitLine("    push('')");
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+void LuaCodeGenerator::emitArithmetic(const IRInstruction& instr) {
+    // Use expression optimizer when possible
+    if (canUseExpressionMode()) {
+        switch (instr.opcode) {
+            case IROpcode::ADD:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::ADD);
+                return;
+            case IROpcode::SUB:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::SUB);
+                return;
+            case IROpcode::MUL:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::MUL);
+                return;
+            case IROpcode::DIV:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::DIV);
+                return;
+            case IROpcode::IDIV:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::IDIV);
+                return;
+            case IROpcode::MOD:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::MOD);
+                return;
+            case IROpcode::POW:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::POW);
+                return;
+            case IROpcode::NEG:
+                m_exprOptimizer.applyUnaryOp(UnaryOp::NEG);
+                return;
+            default:
+                break;
+        }
+    }
+
+    // Fallback to stack-based emission
+    switch (instr.opcode) {
+        case IROpcode::ADD:
+            emitLine("    b = pop(); a = pop(); push(a + b)");
+            break;
+        case IROpcode::SUB:
+            emitLine("    b = pop(); a = pop(); push(a - b)");
+            break;
+        case IROpcode::MUL:
+            emitLine("    b = pop(); a = pop(); push(a * b)");
+            break;
+        case IROpcode::DIV:
+            emitLine("    b = pop(); a = pop(); push(a / b)");
+            break;
+        case IROpcode::IDIV:
+            emitLine("    b = pop(); a = pop(); push(math.floor(a / b))");
+            break;
+        case IROpcode::MOD:
+            emitLine("    b = pop(); a = pop(); push(a % b)");
+            break;
+        case IROpcode::POW:
+            emitLine("    b = pop(); a = pop(); push(a ^ b)");
+            break;
+        case IROpcode::NEG:
+            emitLine("    push(-pop())");
+            break;
+
+        default:
+            break;
+    }
+}
+
+void LuaCodeGenerator::emitComparison(const IRInstruction& instr) {
+    // Use expression optimizer when possible
+    if (canUseExpressionMode()) {
+        switch (instr.opcode) {
+            case IROpcode::EQ:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::EQ);
+                return;
+            case IROpcode::NE:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::NE);
+                return;
+            case IROpcode::LT:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::LT);
+                return;
+            case IROpcode::LE:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::LE);
+                return;
+            case IROpcode::GT:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::GT);
+                return;
+            case IROpcode::GE:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::GE);
+                return;
+            default:
+                break;
+        }
+    }
+
+    // Fallback to stack-based emission
+    switch (instr.opcode) {
+        case IROpcode::EQ:
+            emitLine("    b = pop(); a = pop(); push((a == b) and 1 or 0)");
+            break;
+        case IROpcode::NE:
+            emitLine("    b = pop(); a = pop(); push((a ~= b) and 1 or 0)");
+            break;
+        case IROpcode::LT:
+            emitLine("    b = pop(); a = pop(); push((a < b) and 1 or 0)");
+            break;
+        case IROpcode::LE:
+            emitLine("    b = pop(); a = pop(); push((a <= b) and 1 or 0)");
+            break;
+        case IROpcode::GT:
+            emitLine("    b = pop(); a = pop(); push((a > b) and 1 or 0)");
+            break;
+        case IROpcode::GE:
+            emitLine("    b = pop(); a = pop(); push((a >= b) and 1 or 0)");
+            break;
+        default:
+            break;
+    }
+}
+
+void LuaCodeGenerator::emitLogical(const IRInstruction& instr) {
+    // Use expression optimizer when possible
+    if (canUseExpressionMode()) {
+        switch (instr.opcode) {
+            case IROpcode::AND:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::AND);
+                return;
+            case IROpcode::OR:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::OR);
+                return;
+            case IROpcode::XOR:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::XOR);
+                return;
+            case IROpcode::EQV:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::EQV);
+                return;
+            case IROpcode::IMP:
+                m_exprOptimizer.applyBinaryOp(BinaryOp::IMP);
+                return;
+            case IROpcode::NOT:
+                m_exprOptimizer.applyUnaryOp(UnaryOp::NOT);
+                return;
+            default:
+                break;
+        }
+    }
+
+    // Fallback to stack-based emission
+    // Use bitwise operations by default for BASIC compatibility
+    switch (instr.opcode) {
+        case IROpcode::AND:
+            emitLine("    b = pop(); a = pop(); push(bitwise.band(a, b))");
+            break;
+        case IROpcode::OR:
+            emitLine("    b = pop(); a = pop(); push(bitwise.bor(a, b))");
+            break;
+        case IROpcode::XOR:
+            emitLine("    b = pop(); a = pop(); push(bitwise.bxor(a, b))");
+            break;
+        case IROpcode::EQV:
+            emitLine("    b = pop(); a = pop(); push(bitwise.beqv(a, b))");
+            break;
+        case IROpcode::IMP:
+            emitLine("    b = pop(); a = pop(); push(bitwise.bimp(a, b))");
+            break;
+        case IROpcode::NOT:
+            emitLine("    push(bitwise.bnot(pop()))");
+            break;
+        default:
+            break;
+    }
+}
+
+void LuaCodeGenerator::emitVariable(const IRInstruction& instr) {
+    if (!std::holds_alternative<std::string>(instr.operand1)) return;
+
+    std::string varName = std::get<std::string>(instr.operand1);
+    std::string luaVarName = getVarName(varName);
+
+    // Register variable if not seen before
+    if (m_variables.find(varName) == m_variables.end()) {
+        m_variables[varName] = m_variables.size();
+    }
+
+    switch (instr.opcode) {
+        case IROpcode::LOAD_VAR: {
+            // Use expression optimizer when possible
+            // Get the variable (using hot/cold reference)
+            std::string varRef = m_config.useVariableCache ?
+                                 getVariableReference(varName) : luaVarName;
+
+            if (canUseExpressionMode()) {
+                m_exprOptimizer.pushVariable(varRef);
+            } else {
+                emitLine("    push(" + varRef + ")");
+            }
+            break;
+        }
+
+        case IROpcode::MID_ASSIGN: {
+            // MID$(var$, pos, len) = replacement$
+            // Stack has: pos, len, replacement (top)
+            std::string varName = std::get<std::string>(instr.operand1);
+            std::string varRef = m_config.useVariableCache ?
+                getVariableReference(varName) : getVarName(varName);
+
+            if (canUseExpressionMode() && m_exprOptimizer.size() >= 3) {
+                // Pop replacement, len, pos from expression optimizer
+                auto replacement = m_exprOptimizer.pop();
+                auto len = m_exprOptimizer.pop();
+                auto pos = m_exprOptimizer.pop();
+
+                if (replacement && len && pos) {
+                    std::string replacementStr = m_exprOptimizer.toString(replacement);
+                    std::string lenStr = m_exprOptimizer.toString(len);
+                    std::string posStr = m_exprOptimizer.toString(pos);
+
+                    emitLine("    " + varRef + " = basic_mid_assign(" + varRef + ", " +
+                             posStr + ", " + lenStr + ", " + replacementStr + ")");
+                } else {
+                    flushExpressionToStack();
+                    emitLine("    " + varRef + " = basic_mid_assign(" + varRef + ", pop(), pop(), pop())");
+                }
+            } else {
+                flushExpressionToStack();
+                emitLine("    " + varRef + " = basic_mid_assign(" + varRef + ", pop(), pop(), pop())");
+            }
+            break;
+        }
+
+        case IROpcode::STORE_VAR: {
+            // Store the value from the stack (using hot/cold reference)
+            std::string varRef = m_config.useVariableCache ?
+                                 getVariableReference(varName) : luaVarName;
+
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto expr = m_exprOptimizer.pop();
+                if (expr) {
+                    std::string exprCode = m_exprOptimizer.toString(expr);
+                    emitLine("    " + varRef + " = " + exprCode);
+                } else {
+                    emitLine("    " + varRef + " = pop()");
+                }
+            } else {
+                emitLine("    " + varRef + " = pop()");
+            }
+            break;
+        }
+
+        default:
+            emitLine("    -- Unknown variable opcode: " + std::string(opcodeToString(instr.opcode)));
+            break;
+    }
+}
+
+void LuaCodeGenerator::emitConstant(const IRInstruction& instr) {
+    int index = std::get<int>(instr.operand1);
+
+    // Inline constant values if we have access to the constants manager
+    if (m_constantsManager && m_config.inlineConstants) {
+        ConstantValue value = m_constantsManager->getConstant(index);
+
+        std::string literalValue;
+        if (std::holds_alternative<int64_t>(value)) {
+            literalValue = std::to_string(std::get<int64_t>(value));
+        } else if (std::holds_alternative<double>(value)) {
+            double dval = std::get<double>(value);
+            literalValue = std::to_string(dval);
+        } else if (std::holds_alternative<std::string>(value)) {
+            literalValue = "\"" + escapeString(std::get<std::string>(value)) + "\"";
+        }
+
+        if (canUseExpressionMode()) {
+            m_exprOptimizer.pushLiteral(literalValue);
+        } else {
+            emitLine("    push(" + literalValue + ")");
+        }
+    } else {
+        // Fallback to runtime lookup if constants manager is not available
+        if (canUseExpressionMode()) {
+            m_exprOptimizer.pushLiteral("constants_get(" + std::to_string(index) + ")");
+        } else {
+            emitLine("    push(constants_get(" + std::to_string(index) + "))");
+        }
+    }
+}
+
+void LuaCodeGenerator::emitArray(const IRInstruction& instr) {
+    if (!std::holds_alternative<std::string>(instr.operand1)) return;
+
+    std::string arrayName = std::get<std::string>(instr.operand1);
+    std::string luaArrayName = getArrayName(arrayName);
+    std::string typeSuffix = instr.arrayElementTypeSuffix;
+
+    // Register array if not seen before
+    if (m_arrays.find(arrayName) == m_arrays.end()) {
+        m_arrays[arrayName] = m_arrays.size();
+
+        // Initialize array info
+        ArrayInfo info;
+        info.name = arrayName;
+        info.typeSuffix = typeSuffix;
+        info.usesFFI = false;
+        info.luaVarName = luaArrayName;
+        m_arrayInfo[arrayName] = info;
+    }
+
+    switch (instr.opcode) {
+        case IROpcode::DIM_ARRAY: {
+            // Flush expression optimizer before DIM (side-effecting operation)
+            flushExpressionToStack();
+
+            // Pop dimension(s) and initialize array
+            int dims = 1;
+            if (std::holds_alternative<int>(instr.operand2)) {
+                dims = std::get<int>(instr.operand2);
+            }
+
+            if (dims == 1) {
+                emitLine("    dim = pop()");
+
+                // Use Lua table for 1D array
+                emitLine("    " + luaArrayName + " = {}");
+                emitLine("    for i = 1, dim + 1 do " + luaArrayName + "[i] = 0 end");
+            } else {
+                // Multi-dimensional arrays - pop dimensions in reverse order and initialize nested tables
+                // Pop all dimensions from stack (they were pushed in order, so pop in reverse)
+                for (int i = dims - 1; i >= 0; i--) {
+                    emitLine("    dim" + std::to_string(i) + " = pop()");
+                }
+
+                // Initialize the multi-dimensional array
+                emitLine("    " + luaArrayName + " = {}");
+
+                // Generate nested initialization loops
+                // Multi-dimensional arrays use direct BASIC indexing (0-based or 1-based) in Lua
+                // No conversion needed - Lua tables can handle any integer index
+                std::string indent = "    ";
+                for (int d = 0; d < dims; d++) {
+                    std::string loopVar = "i" + std::to_string(d);
+                    int startIdx = m_arrayBase;
+                    emitLine(indent + "for " + loopVar + " = " + std::to_string(startIdx) + ", " + std::to_string(startIdx) + " + dim" + std::to_string(d) + " do");
+                    indent += "  ";
+                    if (d < dims - 1) {
+                        // Not the last dimension - create nested table
+                        std::string tableAccess = luaArrayName;
+                        for (int k = 0; k <= d; k++) {
+                            tableAccess += "[i" + std::to_string(k) + "]";
+                        }
+                        emitLine(indent + "if not " + tableAccess + " then " + tableAccess + " = {} end");
+                    } else {
+                        // Last dimension - initialize to 0
+                        std::string tableAccess = luaArrayName;
+                        for (int k = 0; k <= d; k++) {
+                            tableAccess += "[i" + std::to_string(k) + "]";
+                        }
+                        emitLine(indent + tableAccess + " = 0");
+                    }
+                }
+                // Close all loops
+                for (int d = 0; d < dims; d++) {
+                    indent = indent.substr(0, indent.length() - 2);
+                    emitLine(indent + "end");
+                }
+            }
+            break;
+        }
+
+        case IROpcode::LOAD_ARRAY: {
+            // Get number of dimensions
+            int dims = 1;
+            if (std::holds_alternative<int>(instr.operand2)) {
+                dims = std::get<int>(instr.operand2);
+            }
+
+            if (dims == 1) {
+                // 1D array - original logic
+                // Pop index and push array[index]
+                if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                    // Get the index expression
+                    auto indexExpr = m_exprOptimizer.pop();
+                    if (indexExpr) {
+                        // Regular Lua table access
+                        // Adjust for OPTION BASE: Lua is 1-based, BASIC can be 0 or 1-based
+                        if (m_arrayBase == 0) {
+                            // OPTION BASE 0: need to add 1 to convert to Lua's 1-based indexing
+                            auto oneLiteral = Expr::makeLiteral("1");
+                            auto adjustedIndex = Expr::makeBinaryOp(BinaryOp::ADD, indexExpr, oneLiteral);
+                            m_exprOptimizer.pushArrayAccess(luaArrayName, adjustedIndex);
+                        } else {
+                            // OPTION BASE 1: indices already match Lua's 1-based indexing
+                            m_exprOptimizer.pushArrayAccess(luaArrayName, indexExpr);
+                        }
+                    } else {
+                        // Fallback
+                        if (m_arrayBase == 0) {
+                            emitLine("    idx = pop() + 1");
+                        } else {
+                            emitLine("    idx = pop()");
+                        }
+                        emitLine("    push(" + luaArrayName + "[idx] or 0)");
+                    }
+                } else {
+                    if (m_arrayBase == 0) {
+                        emitLine("    idx = pop() + 1");
+                    } else {
+                        emitLine("    idx = pop()");
+                    }
+                    emitLine("    push(" + luaArrayName + "[idx] or 0)");
+                }
+            } else {
+                // Multi-dimensional array
+                flushExpressionToStack();
+
+                // Pop all indices in reverse order (they were pushed in order)
+                for (int i = dims - 1; i >= 0; i--) {
+                    emitLine("    idx" + std::to_string(i) + " = pop()");
+                }
+
+                // Build nested table access
+                std::string access = luaArrayName;
+                for (int i = 0; i < dims; i++) {
+                    access += "[idx" + std::to_string(i) + "]";
+                }
+
+                emitLine("    push(" + access + " or 0)");
+            }
+            break;
+        }
+
+        case IROpcode::STORE_ARRAY: {
+            // Get number of dimensions
+            int dims = 1;
+            if (std::holds_alternative<int>(instr.operand2)) {
+                dims = std::get<int>(instr.operand2);
+            }
+
+            // Check if this array uses FFI (only for 1D arrays)
+            bool mayUseFFI = (dims == 1) && m_arrayInfo.count(arrayName) && m_arrayInfo[arrayName].usesFFI;
+
+            if (dims == 1) {
+                // 1D array - original logic
+                // Stack has: [..., value, index] (index on top)
+                // IR generator pushes value first, then index
+                // Pop index first, then value
+                if (canUseExpressionMode() && m_exprOptimizer.size() == 2) {
+                    // Pop in correct order: index (top), then value
+                    auto indexExpr = m_exprOptimizer.pop();
+                    auto valueExpr = m_exprOptimizer.pop();
+
+                    if (valueExpr && indexExpr) {
+                        std::string indexCode = m_exprOptimizer.toString(indexExpr);
+                        std::string valueCode = m_exprOptimizer.toString(valueExpr);
+
+                        if (mayUseFFI) {
+                            // Generate code for both FFI and Lua table paths
+                            emitLine("    if " + luaArrayName + ".data then");
+                            emitLine("        " + luaArrayName + ".data[" + indexCode + "] = " + valueCode);
+                            emitLine("    else");
+                            if (m_arrayBase == 0) {
+                                emitLine("        " + luaArrayName + "[" + indexCode + " + 1] = " + valueCode);
+                            } else {
+                                emitLine("        " + luaArrayName + "[" + indexCode + "] = " + valueCode);
+                            }
+                            emitLine("    end");
+                        } else {
+                            // Regular Lua table store
+                            // Adjust for OPTION BASE: Lua is 1-based, BASIC can be 0 or 1-based
+                            if (m_arrayBase == 0) {
+                                auto oneLiteral = Expr::makeLiteral("1");
+                                auto adjustedIndex = Expr::makeBinaryOp(BinaryOp::ADD, indexExpr, oneLiteral);
+                                std::string adjustedIndexCode = m_exprOptimizer.toString(adjustedIndex);
+                                emitLine("    " + luaArrayName + "[" + adjustedIndexCode + "] = " + valueCode);
+                            } else {
+                                emitLine("    " + luaArrayName + "[" + indexCode + "] = " + valueCode);
+                            }
+                        }
+                    } else {
+                        // Fallback
+                        emitLine("    idx = pop()");
+                        emitLine("    val = pop()");
+                        if (mayUseFFI) {
+                            emitLine("    if " + luaArrayName + ".data then");
+                            emitLine("        " + luaArrayName + ".data[idx] = val");
+                            emitLine("    else");
+                            if (m_arrayBase == 0) {
+                                emitLine("        " + luaArrayName + "[idx + 1] = val");
+                            } else {
+                                emitLine("        " + luaArrayName + "[idx] = val");
+                            }
+                            emitLine("    end");
+                        } else {
+                            if (m_arrayBase == 0) {
+                                emitLine("    " + luaArrayName + "[idx + 1] = val");
+                            } else {
+                                emitLine("    " + luaArrayName + "[idx] = val");
+                            }
+                        }
+                    }
+                } else {
+                    emitLine("    idx = pop()");
+                    emitLine("    val = pop()");
+                    if (mayUseFFI) {
+                        emitLine("    if " + luaArrayName + ".data then");
+                        emitLine("        " + luaArrayName + ".data[idx] = val");
+                        emitLine("    else");
+                        if (m_arrayBase == 0) {
+                            emitLine("        " + luaArrayName + "[idx + 1] = val");
+                        } else {
+                            emitLine("        " + luaArrayName + "[idx] = val");
+                        }
+                        emitLine("    end");
+                    } else {
+                        if (m_arrayBase == 0) {
+                            emitLine("    " + luaArrayName + "[idx + 1] = val");
+                        } else {
+                            emitLine("    " + luaArrayName + "[idx] = val");
+                        }
+                    }
+                }
+            } else {
+                // Multi-dimensional array
+                flushExpressionToStack();
+
+                // Stack has: [..., value, idx0, idx1, ..., idxN-1]
+                // IR generator pushes: value first, then indices in order
+                // So pop indices in reverse order first, then value
+                for (int i = dims - 1; i >= 0; i--) {
+                    emitLine("    idx" + std::to_string(i) + " = pop()");
+                }
+
+                // Pop value last
+                emitLine("    val = pop()");
+
+                // Build nested table access
+                std::string access = luaArrayName;
+                for (int i = 0; i < dims; i++) {
+                    access += "[idx" + std::to_string(i) + "]";
+                }
+
+                emitLine("    " + access + " = val");
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+void LuaCodeGenerator::emitControlFlow(const IRInstruction& instr, size_t index) {
+    std::string labelStr;
+
+    // Flush expression optimizer before conditional jumps
+    // (but not before structured IF/ELSEIF, as we want to use the expression directly)
+    if (instr.opcode == IROpcode::JUMP_IF_FALSE ||
+        instr.opcode == IROpcode::JUMP_IF_TRUE) {
+        flushExpressionToStack();
+    }
+
+    switch (instr.opcode) {
+        case IROpcode::LABEL:
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                labelStr = std::get<std::string>(instr.operand1);
+            } else if (std::holds_alternative<int>(instr.operand1)) {
+                labelStr = std::to_string(std::get<int>(instr.operand1));
+            }
+
+            // Check if this is the start of a native FOR loop body
+            if (!m_forLoopStack.empty()) {
+                auto& loopInfo = m_forLoopStack.back();
+                // Check if we already emitted the native loop (from FOR_INIT)
+                if (loopInfo.canUseNativeLoop && loopInfo.nativeLoopEmitted) {
+                    // Native loop already emitted, this is just a label marker
+                    loopInfo.loopBackLabel = labelStr; // Save for later
+                    // Don't emit the label - we're inside the for loop now
+                    break;
+                }
+            }
+
+            if (!labelStr.empty()) {
+                emitLabel(labelStr);
+            }
+            break;
+
+        case IROpcode::JUMP:
+            // Skip unreachable JUMP after RETURN
+            if (m_lastEmittedOpcode == IROpcode::RETURN_VALUE ||
+                m_lastEmittedOpcode == IROpcode::RETURN_VOID ||
+                m_lastEmittedOpcode == IROpcode::RETURN_GOSUB) {
+                // Unreachable code after return - skip it entirely
+                if (m_config.emitComments) {
+                    emitComment("Skipping unreachable JUMP after RETURN");
+                }
+                break;
+            }
+
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                labelStr = std::get<std::string>(instr.operand1);
+            } else if (std::holds_alternative<int>(instr.operand1)) {
+                labelStr = std::to_string(std::get<int>(instr.operand1));
+            }
+            if (!labelStr.empty()) {
+                emitLine("    goto " + getLabelName(labelStr));
+            }
+            break;
+
+        case IROpcode::JUMP_IF_FALSE:
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                labelStr = std::get<std::string>(instr.operand1);
+            } else if (std::holds_alternative<int>(instr.operand1)) {
+                labelStr = std::to_string(std::get<int>(instr.operand1));
+            }
+            if (!labelStr.empty()) {
+                // Use expression optimizer for condition if available
+                if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                    auto condExpr = m_exprOptimizer.pop();
+                    if (condExpr) {
+                        std::string condCode = m_exprOptimizer.toString(condExpr);
+                        emitLine("    if " + condCode + " == 0 then goto " + getLabelName(labelStr) + " end");
+                    } else {
+                        emitLine("    if pop() == 0 then goto " + getLabelName(labelStr) + " end");
+                    }
+                } else {
+                    emitLine("    if pop() == 0 then goto " + getLabelName(labelStr) + " end");
+                }
+            }
+            break;
+
+        case IROpcode::JUMP_IF_TRUE:
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                labelStr = std::get<std::string>(instr.operand1);
+            } else if (std::holds_alternative<int>(instr.operand1)) {
+                labelStr = std::to_string(std::get<int>(instr.operand1));
+            }
+            if (!labelStr.empty()) {
+                // Use expression optimizer for condition if available
+                if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                    auto condExpr = m_exprOptimizer.pop();
+                    if (condExpr) {
+                        std::string condCode = m_exprOptimizer.toString(condExpr);
+                        emitLine("    if " + condCode + " ~= 0 then goto " + getLabelName(labelStr) + " end");
+                    } else {
+                        emitLine("    if pop() ~= 0 then goto " + getLabelName(labelStr) + " end");
+                    }
+                } else {
+                    emitLine("    if pop() ~= 0 then goto " + getLabelName(labelStr) + " end");
+                }
+            }
+            break;
+
+        case IROpcode::CALL_GOSUB: {
+            // Implement GOSUB as a function call
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                labelStr = std::get<std::string>(instr.operand1);
+            } else if (std::holds_alternative<int>(instr.operand1)) {
+                labelStr = std::to_string(std::get<int>(instr.operand1));
+            }
+            if (!labelStr.empty()) {
+                emitLine("    _gosub." + getLabelName(labelStr) + "()");
+            }
+            break;
+        }
+
+        case IROpcode::RETURN_GOSUB: {
+            // RETURN is handled inside the function itself - skip here
+            // (already emitted as 'return' in the function body)
+            break;
+        }
+
+        case IROpcode::ON_GOTO: {
+            // Implement ON GOTO - computed goto based on selector value
+            // Pop selector from stack and jump to corresponding label (1-based)
+            flushExpressionToStack();
+
+            // Parse comma-separated label IDs from operand
+            std::string targets;
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                targets = std::get<std::string>(instr.operand1);
+            }
+
+            if (!targets.empty()) {
+                // Split targets by comma
+                std::vector<std::string> labelIds;
+                size_t start = 0;
+                size_t pos = 0;
+                while ((pos = targets.find(',', start)) != std::string::npos) {
+                    labelIds.push_back(targets.substr(start, pos - start));
+                    start = pos + 1;
+                }
+                labelIds.push_back(targets.substr(start));
+
+                // Store selector in a temporary variable without local declaration
+                // to avoid Lua goto scope issues
+                emitLine("    _on_temp = pop()");
+
+                // Generate if-elseif chain
+                for (size_t i = 0; i < labelIds.size(); i++) {
+                    std::string labelName = getLabelName(labelIds[i]);
+                    if (i == 0) {
+                        emitLine("    if _on_temp == 1 then goto " + labelName);
+                    } else {
+                        emitLine("    elseif _on_temp == " + std::to_string(i + 1) + " then goto " + labelName);
+                    }
+                }
+                emitLine("    end");
+            }
+            break;
+        }
+
+        case IROpcode::ON_GOSUB: {
+            // Implement ON GOSUB - computed gosub based on selector value
+            flushExpressionToStack();
+
+            // Parse comma-separated label IDs from operand
+            std::string targets;
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                targets = std::get<std::string>(instr.operand1);
+            }
+
+            if (!targets.empty()) {
+                std::vector<std::string> labelIds;
+                size_t start = 0;
+                size_t pos = targets.find(',');
+                while (pos != std::string::npos) {
+                    labelIds.push_back(targets.substr(start, pos - start));
+                    start = pos + 1;
+                    pos = targets.find(',', start);
+                }
+                labelIds.push_back(targets.substr(start));
+
+                // Store selector in a temporary variable without local declaration
+                emitLine("    _on_temp = pop()");
+
+                // Generate if-elseif chain with function calls
+                for (size_t i = 0; i < labelIds.size(); i++) {
+                    std::string labelName = getLabelName(labelIds[i]);
+                    if (i == 0) {
+                        emitLine("    if _on_temp == 1 then");
+                    } else {
+                        emitLine("    elseif _on_temp == " + std::to_string(i + 1) + " then");
+                    }
+                    emitLine("        _gosub." + labelName + "()");
+                }
+                emitLine("    end");
+            }
+            break;
+        }
+
+        case IROpcode::ON_CALL: {
+            // Implement ON CALL - computed function/sub call based on selector value
+            // This is more efficient with table-based dispatch
+            flushExpressionToStack();
+
+            // Parse comma-separated function names from operand
+            std::string targets;
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                targets = std::get<std::string>(instr.operand1);
+            }
+
+            if (!targets.empty()) {
+                // Split targets by comma
+                std::vector<std::string> funcNames;
+                size_t start = 0;
+                size_t pos = 0;
+                while ((pos = targets.find(',', start)) != std::string::npos) {
+                    funcNames.push_back(targets.substr(start, pos - start));
+                    start = pos + 1;
+                }
+                funcNames.push_back(targets.substr(start));
+
+                // Store selector in temporary variable
+                emitLine("    _on_temp = pop()");
+
+                // Generate inline dispatch without local table (to avoid goto scope issues)
+                for (size_t i = 0; i < funcNames.size(); i++) {
+                    // Apply function name mangling (func_ prefix)
+                    std::string funcName = "func_" + funcNames[i];
+                    if (i == 0) {
+                        emitLine("    if _on_temp == 1 then " + funcName + "()");
+                    } else {
+                        emitLine("    elseif _on_temp == " + std::to_string(i + 1) + " then " + funcName + "()");
+                    }
+                }
+                if (!funcNames.empty()) {
+                    emitLine("    end");
+                }
+            }
+            break;
+        }
+
+        case IROpcode::IF_START: {
+            // Begin structured IF block - condition is on stack
+            // Use expression optimizer for condition if available
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto condExpr = m_exprOptimizer.pop();
+                if (condExpr) {
+                    std::string condCode = m_exprOptimizer.toString(condExpr);
+                    emitLine("    if " + condCode + " ~= 0 then");
+                } else {
+                    emitLine("    if pop() ~= 0 then");
+                }
+            } else {
+                emitLine("    if pop() ~= 0 then");
+            }
+            break;
+        }
+
+        case IROpcode::ELSEIF_START: {
+            // Begin ELSEIF block - condition is on stack
+            // Use expression optimizer for condition if available
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto condExpr = m_exprOptimizer.pop();
+                if (condExpr) {
+                    std::string condCode = m_exprOptimizer.toString(condExpr);
+                    emitLine("    elseif " + condCode + " ~= 0 then");
+                } else {
+                    emitLine("    elseif pop() ~= 0 then");
+                }
+            } else {
+                emitLine("    elseif pop() ~= 0 then");
+            }
+            break;
+        }
+
+        case IROpcode::ELSE_START: {
+            // Begin ELSE block
+            emitLine("    else");
+            break;
+        }
+
+        case IROpcode::IF_END: {
+            // End IF block
+            emitLine("    end");
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+void LuaCodeGenerator::emitLoop(const IRInstruction& instr) {
+    switch (instr.opcode) {
+        case IROpcode::FOR_INIT: {
+            // FOR loops need a variable name
+            if (!std::holds_alternative<std::string>(instr.operand1)) {
+                return;
+            }
+
+            std::string varName = std::get<std::string>(instr.operand1);
+            std::string luaVarName = getVarName(varName);
+            // Try to detect native loop opportunity
+            bool canUseNative = false;
+            std::string startExpr, endExpr, stepExpr;
+
+            // Check if we have simple expressions in the expression optimizer
+            if (m_exprOptimizer.size() == 3) {
+                // We have three expressions: start, end, step
+                // Pop them to check if they're simple
+                auto stepE = m_exprOptimizer.pop();
+                auto endE = m_exprOptimizer.pop();
+                auto startE = m_exprOptimizer.pop();
+
+                if (stepE && endE && startE) {
+                    // Check if all are simple (literals or simple variables)
+                    if (m_exprOptimizer.isSimple(stepE) &&
+                        m_exprOptimizer.isSimple(endE) &&
+                        m_exprOptimizer.isSimple(startE)) {
+                        canUseNative = true;
+                        startExpr = m_exprOptimizer.toString(startE);
+                        endExpr = m_exprOptimizer.toString(endE);
+                        stepExpr = m_exprOptimizer.toString(stepE);
+                    } else {
+                        // Not simple enough - put them back and flush
+                        flushExpressionToStack();
+                    }
+                } else {
+                    // Failed to pop - flush whatever we have
+                    flushExpressionToStack();
+                }
+            } else {
+                // Wrong number of expressions - flush to stack
+                flushExpressionToStack();
+            }
+
+            // Save loop context
+            ForLoopInfo info;
+            info.varName = varName;
+            info.canUseNativeLoop = canUseNative;
+            info.startExpr = startExpr;
+            info.endExpr = endExpr;
+            info.stepExpr = stepExpr;
+            info.nativeLoopEmitted = false;
+            info.loopBodyStartIndex = -1;
+
+            if (canUseNative) {
+                // Emit native loop immediately (don't wait for LABEL - structured IFs have no labels!)
+                std::string luaVarName = getVarName(varName);
+                emitLine("    for " + luaVarName + " = " + startExpr + ", " +
+                         endExpr + ", " + stepExpr + " do");
+                info.nativeLoopEmitted = true;
+                info.endValue = endExpr;      // Preserve for potential fallback
+                info.stepValue = stepExpr;    // Preserve for potential fallback
+                info.startAddress = -1;
+            } else {
+                // Stack-based loop - emit initialization using reusable variables
+                emitLine("    for_step = pop()");
+                emitLine("    for_end = pop()");
+                emitLine("    " + luaVarName + " = pop()");
+
+                info.endValue = "for_end";
+                info.stepValue = "for_step";
+                info.startAddress = -1;
+            }
+
+            m_forLoopStack.push_back(info);
+            break;
+        }
+
+        case IROpcode::FOR_CHECK: {
+            // Check if loop should continue
+            if (m_forLoopStack.empty()) break;
+            auto& loopInfo = m_forLoopStack.back();
+
+            std::string luaVarName = getVarName(loopInfo.varName);
+
+            std::string exitLabel;
+            if (std::holds_alternative<std::string>(instr.operand2)) {
+                exitLabel = std::get<std::string>(instr.operand2);
+            } else if (std::holds_alternative<int>(instr.operand2)) {
+                exitLabel = std::to_string(std::get<int>(instr.operand2));
+            }
+
+            emitLine("    if " + loopInfo.stepValue + " > 0 then");
+            emitLine("        if " + luaVarName + " > " + loopInfo.endValue + " then");
+            if (!exitLabel.empty()) {
+                emitLine("            goto " + getLabelName(exitLabel));
+            }
+            emitLine("        end");
+            emitLine("    else");
+            emitLine("        if " + luaVarName + " < " + loopInfo.endValue + " then");
+            if (!exitLabel.empty()) {
+                emitLine("            goto " + getLabelName(exitLabel));
+            }
+            emitLine("        end");
+            emitLine("    end");
+            break;
+        }
+
+        case IROpcode::FOR_NEXT: {
+            // Increment loop variable and check if done, then jump back
+            if (m_forLoopStack.empty()) break;
+            auto& loopInfo = m_forLoopStack.back();
+
+            std::string luaVarName = getVarName(loopInfo.varName);
+
+            if (loopInfo.canUseNativeLoop && loopInfo.nativeLoopEmitted) {
+                // Close the native for loop
+                emitLine("    end");
+                m_forLoopStack.pop_back();
+            } else {
+                // Manual loop - emit increment and check
+                emitLine("    " + luaVarName + " = " + luaVarName + " + " + loopInfo.stepValue);
+
+                // Check if loop should continue (same logic as interpreter's isDone())
+                emitLine("    done = false");
+                emitLine("    if " + loopInfo.stepValue + " > 0 then");
+                emitLine("        done = (" + luaVarName + " > " + loopInfo.endValue + ")");
+                emitLine("    else");
+                emitLine("        done = (" + luaVarName + " < " + loopInfo.endValue + ")");
+                emitLine("    end");
+
+                // Jump back to loop start if not done
+                if (!loopInfo.loopBackLabel.empty()) {
+                    emitLine("    if not done then goto " + getLabelName(loopInfo.loopBackLabel) + " end");
+                }
+
+                m_forLoopStack.pop_back();
+            }
+            break;
+        }
+
+        case IROpcode::WHILE_START: {
+            // Begin WHILE loop with condition on stack
+            if (!m_exprOptimizer.isEmpty()) {
+                auto condExpr = m_exprOptimizer.pop();
+                if (condExpr) {
+                    std::string cond = m_exprOptimizer.toString(condExpr);
+                    emitLine("    while (" + cond + ") ~= 0 do");
+                } else {
+                    emitLine("    while pop() ~= 0 do");
+                }
+            } else {
+                emitLine("    while pop() ~= 0 do");
+            }
+            break;
+        }
+
+        case IROpcode::WHILE_END: {
+            // End WHILE loop
+            emitLine("    end");
+            break;
+        }
+
+        case IROpcode::REPEAT_START: {
+            // Begin REPEAT loop
+            emitLine("    repeat");
+            break;
+        }
+
+        case IROpcode::REPEAT_END: {
+            // End REPEAT loop with UNTIL condition on stack
+            if (!m_exprOptimizer.isEmpty()) {
+                auto condExpr = m_exprOptimizer.pop();
+                if (condExpr) {
+                    std::string cond = m_exprOptimizer.toString(condExpr);
+                    emitLine("    until (" + cond + ") ~= 0");
+                } else {
+                    emitLine("    until pop() ~= 0");
+                }
+            } else {
+                emitLine("    until pop() ~= 0");
+            }
+            break;
+        }
+
+        case IROpcode::DO_WHILE_START: {
+            // DO WHILE (pre-test) - same as WHILE
+            if (!m_exprOptimizer.isEmpty()) {
+                auto condExpr = m_exprOptimizer.pop();
+                if (condExpr) {
+                    std::string cond = m_exprOptimizer.toString(condExpr);
+                    emitLine("    while (" + cond + ") ~= 0 do");
+                } else {
+                    emitLine("    while pop() ~= 0 do");
+                }
+            } else {
+                emitLine("    while pop() ~= 0 do");
+            }
+            // Track that we're in a pre-test WHILE loop
+            DoLoopInfo info;
+            info.type = DoLoopType::PRE_TEST_WHILE;
+            m_doLoopStack.push_back(info);
+            break;
+        }
+
+        case IROpcode::DO_UNTIL_START: {
+            // DO UNTIL (pre-test) - while NOT condition
+            if (!m_exprOptimizer.isEmpty()) {
+                auto condExpr = m_exprOptimizer.pop();
+                if (condExpr) {
+                    std::string cond = m_exprOptimizer.toString(condExpr);
+                    emitLine("    while not ((" + cond + ") ~= 0) do");
+                } else {
+                    emitLine("    while pop() == 0 do");
+                }
+            } else {
+                emitLine("    while pop() == 0 do");
+            }
+            // Track that we're in a pre-test UNTIL loop
+            DoLoopInfo info;
+            info.type = DoLoopType::PRE_TEST_UNTIL;
+            m_doLoopStack.push_back(info);
+            break;
+        }
+
+        case IROpcode::DO_START: {
+            // Plain DO - always emit 'repeat' since all post-test loops use it
+            // For infinite loops, DO_LOOP_END will emit 'until false'
+            emitLine("    repeat");
+            // Track that we're in a post-test or infinite loop
+            // We'll determine which when we see the LOOP opcode
+            DoLoopInfo info;
+            info.type = DoLoopType::INFINITE;  // Default to infinite, may be changed by LOOP_WHILE/UNTIL
+            m_doLoopStack.push_back(info);
+            break;
+        }
+
+        case IROpcode::DO_LOOP_WHILE: {
+            // LOOP WHILE (post-test) - use repeat...until NOT condition
+            if (!m_exprOptimizer.isEmpty()) {
+                auto condExpr = m_exprOptimizer.pop();
+                if (condExpr) {
+                    std::string cond = m_exprOptimizer.toString(condExpr);
+                    emitLine("    until not ((" + cond + ") ~= 0)");
+                } else {
+                    emitLine("    until pop() == 0");
+                }
+            } else {
+                emitLine("    until pop() == 0");
+            }
+            // Mark the current loop as post-test
+            if (!m_doLoopStack.empty()) {
+                m_doLoopStack.back().type = DoLoopType::POST_TEST;
+                m_doLoopStack.pop_back();
+            }
+            break;
+        }
+
+        case IROpcode::DO_LOOP_UNTIL: {
+            // LOOP UNTIL (post-test) - use repeat...until condition
+            if (!m_exprOptimizer.isEmpty()) {
+                auto condExpr = m_exprOptimizer.pop();
+                if (condExpr) {
+                    std::string cond = m_exprOptimizer.toString(condExpr);
+                    emitLine("    until (" + cond + ") ~= 0");
+                } else {
+                    emitLine("    until pop() ~= 0");
+                }
+            } else {
+                emitLine("    until pop() ~= 0");
+            }
+            // Mark the current loop as post-test
+            if (!m_doLoopStack.empty()) {
+                m_doLoopStack.back().type = DoLoopType::POST_TEST;
+                m_doLoopStack.pop_back();
+            }
+            break;
+        }
+
+        case IROpcode::DO_LOOP_END: {
+            // Plain LOOP end - behavior depends on loop type
+            if (!m_doLoopStack.empty()) {
+                DoLoopInfo info = m_doLoopStack.back();
+                m_doLoopStack.pop_back();
+
+                if (info.type == DoLoopType::PRE_TEST_WHILE || info.type == DoLoopType::PRE_TEST_UNTIL) {
+                    // Pre-test loop - close with 'end'
+                    emitLine("    end");
+                } else {
+                    // Infinite loop (DO ... LOOP with no condition) - close with 'until false'
+                    emitLine("    until false");
+                }
+            } else {
+                // No loop info - default to 'until false' for safety
+                emitLine("    until false");
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+void LuaCodeGenerator::emitIO(const IRInstruction& instr) {
+    switch (instr.opcode) {
+        case IROpcode::PRINT:
+            // Use expression optimizer for print if available
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto expr = m_exprOptimizer.pop();
+                if (expr) {
+                    std::string code = m_exprOptimizer.toString(expr);
+                    emitLine("    basic_print(" + code + ")");
+                } else {
+                    emitLine("    basic_print(pop())");
+                }
+            } else {
+                emitLine("    basic_print(pop())");
+            }
+            break;
+
+        case IROpcode::CONSOLE:
+            // Use expression optimizer for console if available
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto expr = m_exprOptimizer.pop();
+                if (expr) {
+                    std::string code = m_exprOptimizer.toString(expr);
+                    emitLine("    basic_console(" + code + ")");
+                } else {
+                    emitLine("    basic_console(pop())");
+                }
+            } else {
+                emitLine("    basic_console(pop())");
+            }
+            break;
+
+        case IROpcode::PRINT_NEWLINE:
+            emitLine("    basic_print_newline()");
+            break;
+
+        case IROpcode::PRINT_USING: {
+            // PRINT USING: format string on stack, then N values
+            int argCount = std::holds_alternative<int>(instr.operand1) ? std::get<int>(instr.operand1) : 0;
+
+            if (canUseExpressionMode() && m_exprOptimizer.size() >= argCount + 1) {
+                // Pop values in reverse order (they're on the stack)
+                std::vector<std::string> values;
+                for (int i = 0; i < argCount; i++) {
+                    auto expr = m_exprOptimizer.pop();
+                    if (expr) {
+                        values.insert(values.begin(), m_exprOptimizer.toString(expr));
+                    } else {
+                        values.insert(values.begin(), "pop()");
+                    }
+                }
+
+                // Pop format string
+                auto formatExpr = m_exprOptimizer.pop();
+                std::string formatStr;
+                if (formatExpr) {
+                    formatStr = m_exprOptimizer.toString(formatExpr);
+                } else {
+                    formatStr = "pop()";
+                }
+
+                // Emit call to basic_print_using
+                std::string args = formatStr;
+                for (const auto& val : values) {
+                    args += ", " + val;
+                }
+                emitLine("    basic_print(basic_print_using(" + args + "))");
+                emitLine("    io.write('\\n')");
+            } else {
+                // Fallback to stack-based
+                std::string popVals;
+                for (int i = 0; i < argCount; i++) {
+                    if (i > 0) popVals = ", " + popVals;
+                    popVals = "pop()" + popVals;
+                }
+                if (argCount > 0) {
+                    emitLine("    basic_print(basic_print_using(pop(), " + popVals + "))");
+                } else {
+                    emitLine("    basic_print(basic_print_using(pop()))");
+                }
+                emitLine("    io.write('\\n')");
+            }
+            break;
+        }
+
+        case IROpcode::INPUT_PROMPT:
+            // Print the prompt without newline
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                std::string prompt = std::get<std::string>(instr.operand1);
+                emitLine("    io.write(" + escapeString(prompt) + ")");
+            }
+            break;
+
+        case IROpcode::PRINT_AT: {
+            // PRINT_AT: x, y, N text items, fg, bg on stack
+            // Pop in reverse: bg, fg, then N text items, then y, x
+            int itemCount = std::holds_alternative<int>(instr.operand1) ? std::get<int>(instr.operand1) : 0;
+
+            flushExpressionToStack();
+
+            // Pop colors
+            emitLine("    local _bg = pop()");
+            emitLine("    local _fg = pop()");
+
+            // Pop and concatenate text items
+            if (itemCount == 0) {
+                emitLine("    local _text = \"\"");
+            } else if (itemCount == 1) {
+                emitLine("    local _text = tostring(pop())");
+            } else {
+                // Pop items into local variables (they come off in reverse order)
+                for (int i = 0; i < itemCount; i++) {
+                    emitLine("    local _item" + std::to_string(i) + " = pop()");
+                }
+                // Now concatenate in reverse order to get original order
+                emitLine("    local _text = \"\"");
+                for (int i = itemCount - 1; i >= 0; i--) {
+                    emitLine("    _text = _text .. tostring(_item" + std::to_string(i) + ")");
+                }
+            }
+
+            // Pop y and x coordinates
+            emitLine("    local _y = pop()");
+            emitLine("    local _x = pop()");
+
+            // Call text_put
+            emitLine("    text_put(_x, _y, _text, _fg, _bg)");
+            break;
+        }
+
+        case IROpcode::PRINT_AT_USING: {
+            // PRINT_AT USING: x, y, format, N values, fg, bg on stack
+            int valueCount = std::holds_alternative<int>(instr.operand1) ? std::get<int>(instr.operand1) : 0;
+
+            flushExpressionToStack();
+
+            // Pop colors
+            emitLine("    local _bg = pop()");
+            emitLine("    local _fg = pop()");
+
+            // Pop values for formatting
+            std::vector<std::string> values;
+            for (int i = 0; i < valueCount; i++) {
+                values.insert(values.begin(), "pop()");
+            }
+
+            // Pop format string
+            emitLine("    local _format = pop()");
+
+            // Pop y and x coordinates
+            emitLine("    local _y = pop()");
+            emitLine("    local _x = pop()");
+
+            // Format the text using basic_print_using
+            emitLine("    local _text = basic_print_using(_format" +
+                    (values.empty() ? "" : ", " + std::accumulate(
+                        std::next(values.begin()), values.end(), values[0],
+                        [](const std::string& a, const std::string& b) { return a + ", " + b; })) + ")");
+
+            // Call text_put
+            emitLine("    text_put(_x, _y, _text, _fg, _bg)");
+            break;
+        }
+
+        case IROpcode::INPUT:
+            // Flush expression optimizer before INPUT (side-effecting)
+            flushExpressionToStack();
+
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                std::string varName = std::get<std::string>(instr.operand1);
+                // Use getVariableReference to respect hot/cold variable system
+                std::string varRef = m_config.useVariableCache ?
+                                     getVariableReference(varName) : getVarName(varName);
+                // Check if it's a string variable
+                if (varName.find("_STRING") != std::string::npos) {
+                    emitLine("    " + varRef + " = basic_input_string()");
+                } else {
+                    emitLine("    " + varRef + " = basic_input()");
+                }
+            }
+            break;
+
+        case IROpcode::INPUT_AT: {
+            // INPUT_AT: x, y on stack, prompt and variable in operands
+            // Pop coordinates from stack
+            flushExpressionToStack();
+
+            emitLine("    local _y = pop()");
+            emitLine("    local _x = pop()");
+
+            // Get prompt and variable name from operands
+            std::string prompt = std::holds_alternative<std::string>(instr.operand1) ?
+                                std::get<std::string>(instr.operand1) : "";
+            std::string varName = std::holds_alternative<std::string>(instr.operand2) ?
+                                 std::get<std::string>(instr.operand2) : "";
+
+            if (!varName.empty()) {
+                // Use mangled name to match hot variable declarations (name$ -> var_name_STRING)
+                std::string mangledName = mangleName(varName);
+                std::string varRef = "var_" + mangledName;
+
+                // Generate the input_at call
+                if (!prompt.empty()) {
+                    emitLine("    " + varRef + " = basic_input_at(_x, _y, \"" + prompt + "\")");
+                } else {
+                    emitLine("    " + varRef + " = basic_input_at(_x, _y, \"\")");
+                }
+            }
+            break;
+        }
+
+        case IROpcode::READ_DATA:
+            // Flush expression optimizer before READ (side-effecting)
+            flushExpressionToStack();
+
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                std::string varName = std::get<std::string>(instr.operand1);
+                // Use getVariableReference to respect hot/cold variable system
+                std::string varRef = m_config.useVariableCache ?
+                                     getVariableReference(varName) : getVarName(varName);
+                // Check if it's a string variable
+                if (varName.find("_STRING") != std::string::npos) {
+                    emitLine("    " + varRef + " = basic_read_data_string()");
+                } else {
+                    emitLine("    " + varRef + " = basic_read_data()");
+                }
+            }
+            break;
+
+        case IROpcode::RESTORE:
+            // Flush expression optimizer before RESTORE (side-effecting)
+            flushExpressionToStack();
+
+            if (std::holds_alternative<int>(instr.operand1)) {
+                // RESTORE to line number
+                int lineNumber = std::get<int>(instr.operand1);
+                emitLine("    basic_restore(" + std::to_string(lineNumber) + ")");
+            } else if (std::holds_alternative<std::string>(instr.operand1)) {
+                // RESTORE to label name
+                std::string labelName = std::get<std::string>(instr.operand1);
+                emitLine("    basic_restore(" + escapeString(labelName) + ")");
+            } else {
+                // RESTORE with no argument - restore to beginning
+                emitLine("    basic_restore()");
+            }
+            break;
+
+        case IROpcode::OPEN_FILE:
+            // OPEN file (operands: filename, mode, filenum)
+            flushExpressionToStack();
+            {
+                std::string filename = std::get<std::string>(instr.operand1);
+                std::string mode = std::get<std::string>(instr.operand2);
+                std::string filenum = std::get<std::string>(instr.operand3);
+                emitLine("    basic_open(\"" + filename + "\", \"" + mode + "\", " + filenum + ")");
+            }
+            break;
+
+        case IROpcode::CLOSE_FILE:
+            // CLOSE #n
+            flushExpressionToStack();
+            {
+                std::string filenum = std::get<std::string>(instr.operand1);
+                emitLine("    basic_close(" + filenum + ")");
+            }
+            break;
+
+        case IROpcode::CLOSE_FILE_ALL:
+            // CLOSE (all files)
+            flushExpressionToStack();
+            emitLine("    basic_close()");
+            break;
+
+        case IROpcode::PRINT_FILE:
+            // PRINT# filenum, value
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto expr = m_exprOptimizer.pop();
+                if (expr) {
+                    std::string code = m_exprOptimizer.toString(expr);
+                    std::string filenum = std::get<std::string>(instr.operand1);
+                    std::string separator = std::get<std::string>(instr.operand2);
+                    emitLine("    basic_print_file(" + filenum + ", " + code + ", " + escapeString(separator) + ")");
+                }
+            } else {
+                flushExpressionToStack();
+                std::string filenum = std::get<std::string>(instr.operand1);
+                std::string separator = std::get<std::string>(instr.operand2);
+                emitLine("    basic_print_file(" + filenum + ", pop(), " + escapeString(separator) + ")");
+            }
+            break;
+
+        case IROpcode::PRINT_FILE_NEWLINE:
+            // Print newline to file
+            flushExpressionToStack();
+            {
+                std::string filenum = std::get<std::string>(instr.operand1);
+                emitLine("    basic_print_file(" + filenum + ", \"\", \"\\\\n\")");
+            }
+            break;
+
+        case IROpcode::INPUT_FILE:
+            // INPUT# filenum, var
+            flushExpressionToStack();
+            {
+                std::string filenum = std::get<std::string>(instr.operand1);
+                std::string varname = std::get<std::string>(instr.operand2);
+                emitLine("    " + getVariableReference(varname) + " = basic_input_file(" + filenum + ")");
+            }
+            break;
+
+        case IROpcode::LINE_INPUT_FILE:
+            // LINE INPUT# filenum, var
+            flushExpressionToStack();
+            {
+                std::string filenum = std::get<std::string>(instr.operand1);
+                std::string varname = std::get<std::string>(instr.operand2);
+                emitLine("    " + getVariableReference(varname) + " = basic_line_input_file(" + filenum + ")");
+            }
+            break;
+
+        case IROpcode::WRITE_FILE:
+            // WRITE# filenum, value (quoted output)
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto expr = m_exprOptimizer.pop();
+                if (expr) {
+                    std::string code = m_exprOptimizer.toString(expr);
+                    std::string filenum = std::get<std::string>(instr.operand1);
+                    bool isLast = std::get<int>(instr.operand2) != 0;
+                    emitLine("    basic_write_file(" + filenum + ", " + code + ", " + (isLast ? "true" : "false") + ")");
+                }
+            } else {
+                flushExpressionToStack();
+                std::string filenum = std::get<std::string>(instr.operand1);
+                bool isLast = std::get<int>(instr.operand2) != 0;
+                emitLine("    basic_write_file(" + filenum + ", pop(), " + (isLast ? "true" : "false") + ")");
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+void LuaCodeGenerator::emitBuiltinFunction(const IRInstruction& instr) {
+    if (!std::holds_alternative<std::string>(instr.operand1)) return;
+
+    std::string funcName = std::get<std::string>(instr.operand1);
+    int argCount = std::holds_alternative<int>(instr.operand2) ? std::get<int>(instr.operand2) : 0;
+
+    // OPTIMIZATION 1: Handle native Lua math functions FIRST (before modular commands)
+    // This ensures SIN, COS, etc. use expression optimizer instead of falling back to stack
+    std::string luaFunc;
+    
+    // Math functions (1 argument)
+    if (funcName == "SIN") luaFunc = "math.sin";
+    else if (funcName == "COS") luaFunc = "math.cos";
+    else if (funcName == "TAN") luaFunc = "math.tan";
+    else if (funcName == "ATN") luaFunc = "math.atan";
+    else if (funcName == "SQR") luaFunc = "math.sqrt";
+    else if (funcName == "INT") luaFunc = "math.floor";
+    else if (funcName == "ABS") luaFunc = "math.abs";
+    else if (funcName == "LOG") luaFunc = "math.log";
+    else if (funcName == "EXP") luaFunc = "math.exp";
+    else if (funcName == "SGN") {
+        // SGN needs special handling: SGN(x) = x>0 ? 1 : x<0 ? -1 : 0
+        if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+            auto argExpr = m_exprOptimizer.pop();
+            if (argExpr) {
+                std::string argStr = m_exprOptimizer.toString(argExpr);
+                std::string sgnExpr = "((" + argStr + ") > 0 and 1 or (" + argStr + ") < 0 and -1 or 0)";
+                m_exprOptimizer.pushVariable(sgnExpr);
+            } else {
+                emitLine("    a = pop(); push(a > 0 and 1 or a < 0 and -1 or 0)");
+            }
+        } else {
+            emitLine("    a = pop(); push(a > 0 and 1 or a < 0 and -1 or 0)");
+        }
+        return;
+    }
+    
+    // OPTIMIZATION 2: Handle native string functions BEFORE modular registry check
+    // This ensures LEFT$, RIGHT$, MID$, etc. use expression optimizer instead of stack operations
+    
+    // String conversion functions (1 argument)
+    else if (funcName == "STR_STRING" || funcName == "STR$" || funcName == "STR") {
+        // STR$(n) converts number to string
+        if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+            auto argExpr = m_exprOptimizer.pop();
+            if (argExpr) {
+                m_exprOptimizer.pushVariable("tostring(" + m_exprOptimizer.toString(argExpr) + ")");
+            } else {
+                emitLine("    push(tostring(pop()))");
+            }
+        } else {
+            emitLine("    push(tostring(pop()))");
+        }
+        return;
+    }
+    else if (funcName == "VAL") {
+        // VAL(s) converts string to number
+        if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+            auto argExpr = m_exprOptimizer.pop();
+            if (argExpr) {
+                m_exprOptimizer.pushVariable("tonumber(" + m_exprOptimizer.toString(argExpr) + ") or 0");
+            } else {
+                emitLine("    push(tonumber(pop()) or 0)");
+            }
+        } else {
+            emitLine("    push(tonumber(pop()) or 0)");
+        }
+        return;
+    }
+    else if (funcName == "ASC") {
+        // ASC(s) returns ASCII/Unicode code of first character
+        if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+            auto argExpr = m_exprOptimizer.pop();
+            if (argExpr) {
+                if (m_unicodeMode) {
+                    m_exprOptimizer.pushVariable("unicode.asc(" + m_exprOptimizer.toString(argExpr) + ")");
+                } else {
+                    std::string argStr = m_exprOptimizer.toString(argExpr);
+                    m_exprOptimizer.pushVariable("string.byte(" + argStr + ", 1)");
+                }
+            } else {
+                if (m_unicodeMode) {
+                    emitLine("    push(unicode.asc(pop()))");
+                } else {
+                    emitLine("    push(string.byte(pop(), 1))");
+                }
+            }
+        } else {
+            if (m_unicodeMode) {
+                emitLine("    push(unicode.asc(pop()))");
+            } else {
+                emitLine("    push(string.byte(pop(), 1))");
+            }
+        }
+        return;
+    }
+    else if (funcName == "CHR_STRING" || funcName == "CHR$" || funcName == "CHR") {
+        // CHR$(n) returns character with ASCII/Unicode code n
+        if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+            auto argExpr = m_exprOptimizer.pop();
+            if (argExpr) {
+                if (m_unicodeMode) {
+                    m_exprOptimizer.pushVariable("unicode.chr(" + m_exprOptimizer.toString(argExpr) + ")");
+                } else {
+                    m_exprOptimizer.pushVariable("string.char(" + m_exprOptimizer.toString(argExpr) + ")");
+                }
+            } else {
+                if (m_unicodeMode) {
+                    emitLine("    push(unicode.chr(pop()))");
+                } else {
+                    emitLine("    push(string.char(pop()))");
+                }
+            }
+        } else {
+            if (m_unicodeMode) {
+                emitLine("    push(unicode.chr(pop()))");
+            } else {
+                emitLine("    push(string.char(pop()))");
+            }
+        }
+        return;
+    }
+    
+    // String manipulation functions (2 arguments)
+    else if (funcName == "LEFT_STRING" || funcName == "LEFT$" || funcName == "LEFT") {
+        // LEFT$(s, n) returns leftmost n characters
+        if (canUseExpressionMode() && m_exprOptimizer.size() >= 2) {
+            auto lenExpr = m_exprOptimizer.pop();
+            auto strExpr = m_exprOptimizer.pop();
+            if (lenExpr && strExpr) {
+                if (m_unicodeMode) {
+                    std::string result = "unicode.left(" + m_exprOptimizer.toString(strExpr) + ", " +
+                                        m_exprOptimizer.toString(lenExpr) + ")";
+                    m_exprOptimizer.pushVariable(result);
+                } else {
+                    std::string result = "string.sub(" + m_exprOptimizer.toString(strExpr) + ", 1, " +
+                                        m_exprOptimizer.toString(lenExpr) + ")";
+                    m_exprOptimizer.pushVariable(result);
+                }
+            } else {
+                if (m_unicodeMode) {
+                    emitLine("    b = pop(); a = pop(); push(unicode.left(a, b))");
+                } else {
+                    emitLine("    b = pop(); a = pop(); push(string.sub(a, 1, b))");
+                }
+            }
+        } else {
+            if (m_unicodeMode) {
+                emitLine("    b = pop(); a = pop(); push(unicode.left(a, b))");
+            } else {
+                emitLine("    b = pop(); a = pop(); push(string.sub(a, 1, b))");
+            }
+        }
+        return;
+    }
+    else if (funcName == "RIGHT_STRING" || funcName == "RIGHT$" || funcName == "RIGHT") {
+        // RIGHT$(s, n) returns rightmost n characters
+        if (canUseExpressionMode() && m_exprOptimizer.size() >= 2) {
+            auto lenExpr = m_exprOptimizer.pop();
+            auto strExpr = m_exprOptimizer.pop();
+            if (lenExpr && strExpr) {
+                if (m_unicodeMode) {
+                    std::string result = "unicode.right(" + m_exprOptimizer.toString(strExpr) + ", " +
+                                        m_exprOptimizer.toString(lenExpr) + ")";
+                    m_exprOptimizer.pushVariable(result);
+                } else {
+                    // RIGHT$(s, n) = string.sub(s, -n)
+                    std::string result = "string.sub(" + m_exprOptimizer.toString(strExpr) + ", -" +
+                                        m_exprOptimizer.toString(lenExpr) + ")";
+                    m_exprOptimizer.pushVariable(result);
+                }
+            } else {
+                if (m_unicodeMode) {
+                    emitLine("    b = pop(); a = pop(); push(unicode.right(a, b))");
+                } else {
+                    emitLine("    b = pop(); a = pop(); push(string.sub(a, -b))");
+                }
+            }
+        } else {
+            if (m_unicodeMode) {
+                emitLine("    b = pop(); a = pop(); push(unicode.right(a, b))");
+            } else {
+                emitLine("    b = pop(); a = pop(); push(string.sub(a, -b))");
+            }
+        }
+        return;
+    }
+    else if (funcName == "MID_STRING" || funcName == "MID$" || funcName == "MID") {
+        // MID$(s, start, len) returns substring (BASIC uses 1-based indexing)
+        if (canUseExpressionMode() && m_exprOptimizer.size() >= 3) {
+            auto lenExpr = m_exprOptimizer.pop();
+            auto startExpr = m_exprOptimizer.pop();
+            auto strExpr = m_exprOptimizer.pop();
+            if (lenExpr && startExpr && strExpr) {
+                if (m_unicodeMode) {
+                    std::string result = "unicode.mid(" + m_exprOptimizer.toString(strExpr) + ", " +
+                                        m_exprOptimizer.toString(startExpr) + ", " +
+                                        m_exprOptimizer.toString(lenExpr) + ")";
+                    m_exprOptimizer.pushVariable(result);
+                } else {
+                    // MID$(s, start, len) = string.sub(s, start, start + len - 1)
+                    std::string startStr = m_exprOptimizer.toString(startExpr);
+                    std::string lenStr = m_exprOptimizer.toString(lenExpr);
+                    std::string result = "string.sub(" + m_exprOptimizer.toString(strExpr) + ", " +
+                                        startStr + ", " + startStr + " + " + lenStr + " - 1)";
+                    m_exprOptimizer.pushVariable(result);
+                }
+            } else {
+                if (m_unicodeMode) {
+                    emitLine("    c = pop(); b = pop(); a = pop(); push(unicode.mid(a, b, c))");
+                } else {
+                    emitLine("    c = pop(); b = pop(); a = pop(); push(string.sub(a, b, b + c - 1))");
+                }
+            }
+        } else {
+            if (m_unicodeMode) {
+                emitLine("    c = pop(); b = pop(); a = pop(); push(unicode.mid(a, b, c))");
+            } else {
+                emitLine("    c = pop(); b = pop(); a = pop(); push(string.sub(a, b, b + c - 1))");
+            }
+        }
+        return;
+    }
+    
+    // String case conversion (1 argument)
+    else if (funcName == "UCASE_STRING" || funcName == "UCASE$" || funcName == "UCASE") {
+        // UCASE$(s) returns uppercase string
+        if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+            auto argExpr = m_exprOptimizer.pop();
+            if (argExpr) {
+                if (m_unicodeMode) {
+                    m_exprOptimizer.pushVariable("unicode.ucase(" + m_exprOptimizer.toString(argExpr) + ")");
+                } else {
+                    m_exprOptimizer.pushVariable("string.upper(" + m_exprOptimizer.toString(argExpr) + ")");
+                }
+            } else {
+                if (m_unicodeMode) {
+                    emitLine("    push(unicode.ucase(pop()))");
+                } else {
+                    emitLine("    push(string.upper(pop()))");
+                }
+            }
+        } else {
+            if (m_unicodeMode) {
+                emitLine("    push(unicode.ucase(pop()))");
+            } else {
+                emitLine("    push(string.upper(pop()))");
+            }
+        }
+        return;
+    }
+    else if (funcName == "LCASE_STRING" || funcName == "LCASE$" || funcName == "LCASE") {
+        // LCASE$(s) returns lowercase string
+        if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+            auto argExpr = m_exprOptimizer.pop();
+            if (argExpr) {
+                if (m_unicodeMode) {
+                    m_exprOptimizer.pushVariable("unicode.lcase(" + m_exprOptimizer.toString(argExpr) + ")");
+                } else {
+                    m_exprOptimizer.pushVariable("string.lower(" + m_exprOptimizer.toString(argExpr) + ")");
+                }
+            } else {
+                if (m_unicodeMode) {
+                    emitLine("    push(unicode.lcase(pop()))");
+                } else {
+                    emitLine("    push(string.lower(pop()))");
+                }
+            }
+        } else {
+            if (m_unicodeMode) {
+                emitLine("    push(unicode.lcase(pop()))");
+            } else {
+                emitLine("    push(string.lower(pop()))");
+            }
+        }
+        return;
+    }
+
+    // If we have a native Lua mapping for single-argument math function
+    if (!luaFunc.empty()) {
+        if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+            auto argExpr = m_exprOptimizer.pop();
+            if (argExpr) {
+                m_exprOptimizer.pushVariable(luaFunc + "(" + m_exprOptimizer.toString(argExpr) + ")");
+            } else {
+                emitLine("    push(" + luaFunc + "(pop()))");
+            }
+        } else {
+            emitLine("    push(" + luaFunc + "(pop()))");
+        }
+        return;
+    }
+
+    // Now check if this is a registry-based modular command or function
+    // Ensure the global registry is initialized
+    FasterBASIC::ModularCommands::initializeGlobalRegistry();
+    auto& registry = FasterBASIC::ModularCommands::getGlobalCommandRegistry();
+
+    // Check both commands and functions
+    const auto* commandDef = registry.getCommand(funcName);
+    const auto* functionDef = registry.getFunction(funcName);
+    const auto* def = commandDef ? commandDef : functionDef;
+
+    if (def) {
+        // Enhanced parameter handling for modular commands
+        std::vector<std::string> paramNames;
+        int paramCount = def->parameters.size();
+        
+        if (paramCount > 0) {
+            // Try direct expression optimization first (no locals needed)
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty() && 
+                m_exprOptimizer.size() >= paramCount) {
+                
+                // Generate direct parameter expressions (no local variables)
+                for (int i = paramCount - 1; i >= 0; i--) {
+                    auto expr = m_exprOptimizer.pop();
+                    if (expr) {
+                        paramNames.insert(paramNames.begin(), m_exprOptimizer.toString(expr));
+                    } else {
+                        paramNames.insert(paramNames.begin(), "nil");
+                    }
+                }
+            } else {
+                // Fallback to parameter pool (reuses param0-param19)
+                flushExpressionToStack();
+                std::string popSequence;
+                for (int i = paramCount - 1; i >= 0; i--) {
+                    popSequence += "param" + std::to_string(i) + " = pop(); ";
+                    paramNames.insert(paramNames.begin(), "param" + std::to_string(i));
+                }
+                emitLine("    " + popSequence);
+            }
+        }
+
+        // Check if we have custom code generation
+        if (def->hasCustomCodeGen) {
+            // Use custom code template - simple substitution for now
+            std::string customCode = def->customCodeTemplate;
+            // Replace parameter placeholders with actual parameter names
+            for (size_t i = 0; i < paramNames.size(); i++) {
+                std::string placeholder = "{" + std::to_string(i) + "}";
+                size_t pos = 0;
+                while ((pos = customCode.find(placeholder, pos)) != std::string::npos) {
+                    customCode.replace(pos, placeholder.length(), paramNames[i]);
+                    pos += paramNames[i].length();
+                }
+            }
+
+            // Handle return value for functions
+            if (def->isFunction) {
+                emitLine("    push(" + customCode + ")");
+            } else {
+                emitLine("    " + customCode);
+            }
+        } else {
+            // Standard function call generation
+            std::string callParams;
+            for (size_t i = 0; i < paramNames.size(); i++) {
+                if (i > 0) callParams += ", ";
+                callParams += paramNames[i];
+            }
+
+            // Handle return value for functions
+            if (def->isFunction) {
+                emitLine("    push(" + def->luaFunction + "(" + callParams + "))");
+            } else {
+                emitLine("    " + def->luaFunction + "(" + callParams + ")");
+            }
+        }
+        return;
+    }
+
+    // Special handling for PRINT_AT with PRINT-style syntax
+    // Debug: Check what funcName we're getting
+    if (funcName == "PRINT_AT") {
+        emitLine("    -- DEBUG: PRINT_AT handler called with " + std::to_string(argCount) + " args");
+        flushExpressionToStack();
+
+        // PRINT_AT has variable arguments depending on mode:
+        // Basic mode: x, y, text1, [text2, ...], [fg], [bg]
+        // USING mode: x, y, format, -1 (marker), value1, [value2, ...], fg, bg
+
+        // Pop all arguments in reverse order
+        std::vector<std::string> args;
+        for (int i = 0; i < argCount; i++) {
+            args.insert(args.begin(), "pop()");
+        }
+
+        if (argCount < 2) {
+            // Invalid - need at least x and y
+            emitLine("    -- ERROR: PRINT_AT requires at least x, y coordinates");
+            return;
+        }
+
+        std::string xCoord = args[0];
+        std::string yCoord = args[1];
+
+        // Check for USING mode (marker is -1 at position 3)
+        bool hasUsing = false;
+        if (argCount >= 4) {
+            // We need to check if arg[3] is -1, but it's already popped
+            // For now, we'll use a simpler approach: if argCount >= 4 and we detect pattern
+            // We'll generate code that checks at runtime
+            emitLine("    local _x = " + xCoord);
+            emitLine("    local _y = " + yCoord);
+
+            if (argCount == 3) {
+                // Simple case: x, y, text
+                emitLine("    local _text = tostring(" + args[2] + ")");
+                emitLine("    text_put(_x, _y, _text, 0xFFFFFFFF, 0x000000FF)");
+            } else if (argCount == 4) {
+                // Could be: x, y, text, fg  OR  x, y, text1, text2
+                emitLine("    local _text = tostring(" + args[2] + ") .. tostring(" + args[3] + ")");
+                emitLine("    text_put(_x, _y, _text, 0xFFFFFFFF, 0x000000FF)");
+            } else if (argCount == 5) {
+                // x, y, text, fg, bg  OR  x, y, text1, text2, text3
+                // Assume last two are colors if they look numeric
+                emitLine("    local _arg3 = " + args[2]);
+                emitLine("    local _arg4 = " + args[3]);
+                emitLine("    local _arg5 = " + args[4]);
+                emitLine("    local _text = tostring(_arg3)");
+                emitLine("    local _fg = _arg4");
+                emitLine("    local _bg = _arg5");
+                emitLine("    text_put(_x, _y, _text, _fg, _bg)");
+            } else {
+                // Multiple text expressions: concatenate all but last 2 (which are colors)
+                emitLine("    local _text = \"\"");
+                for (size_t i = 2; i < args.size() - 2; i++) {
+                    emitLine("    _text = _text .. tostring(" + args[i] + ")");
+                }
+                emitLine("    local _fg = " + args[args.size() - 2]);
+                emitLine("    local _bg = " + args[args.size() - 1]);
+                emitLine("    text_put(_x, _y, _text, _fg, _bg)");
+            }
+        } else {
+            // Only x, y provided - use empty text
+            emitLine("    text_put(" + xCoord + ", " + yCoord + ", \"\", 0xFFFFFFFF, 0x000000FF)");
+        }
+
+        return;
+    }
+
+    // Map BASIC builtin to native Lua function
+    // Native Lua math functions are now handled above - this section is for remaining functions
+
+    // String functions
+    if (funcName == "LEN") {
+        if (m_unicodeMode) {
+            // In Unicode mode, use unicode.len (which is just # operator on table)
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto argExpr = m_exprOptimizer.pop();
+                if (argExpr) {
+                    m_exprOptimizer.pushVariable("unicode.len(" + m_exprOptimizer.toString(argExpr) + ")");
+                } else {
+                    emitLine("    push(unicode.len(pop()))");
+                }
+            } else {
+                emitLine("    push(unicode.len(pop()))");
+            }
+            return;
+        } else {
+            luaFunc = "string.len";
+        }
+    }
+    else if (funcName == "ASC") {
+        // ASC(s) returns ASCII/Unicode code of first character
+        if (m_unicodeMode) {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto argExpr = m_exprOptimizer.pop();
+                if (argExpr) {
+                    m_exprOptimizer.pushVariable("unicode.asc(" + m_exprOptimizer.toString(argExpr) + ")");
+                } else {
+                    emitLine("    push(unicode.asc(pop()))");
+                }
+            } else {
+                emitLine("    push(unicode.asc(pop()))");
+            }
+        } else {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto argExpr = m_exprOptimizer.pop();
+                if (argExpr) {
+                    std::string argStr = m_exprOptimizer.toString(argExpr);
+                    m_exprOptimizer.pushVariable("string.byte(" + argStr + ", 1)");
+                } else {
+                    emitLine("    push(string.byte(pop(), 1))");
+                }
+            } else {
+                emitLine("    push(string.byte(pop(), 1))");
+            }
+        }
+        return;
+    }
+    else if (funcName == "CHR_STRING" || funcName == "CHR$" || funcName == "CHR") {
+        // CHR$(n) returns character with ASCII/Unicode code n
+        if (m_unicodeMode) {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto argExpr = m_exprOptimizer.pop();
+                if (argExpr) {
+                    m_exprOptimizer.pushVariable("unicode.chr(" + m_exprOptimizer.toString(argExpr) + ")");
+                } else {
+                    emitLine("    push(unicode.chr(pop()))");
+                }
+            } else {
+                emitLine("    push(unicode.chr(pop()))");
+            }
+        } else {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto argExpr = m_exprOptimizer.pop();
+                if (argExpr) {
+                    std::string argStr = m_exprOptimizer.toString(argExpr);
+                    m_exprOptimizer.pushVariable("string.char(" + argStr + ")");
+                } else {
+                    emitLine("    push(string.char(pop()))");
+                }
+            } else {
+                emitLine("    push(string.char(pop()))");
+            }
+        }
+        return;
+    }
+    else if (funcName == "STR_STRING" || funcName == "STR$" || funcName == "STR") {
+        // STR$(n) converts number to string
+        if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+            auto argExpr = m_exprOptimizer.pop();
+            if (argExpr) {
+                m_exprOptimizer.pushVariable("tostring(" + m_exprOptimizer.toString(argExpr) + ")");
+            } else {
+                emitLine("    push(tostring(pop()))");
+            }
+        } else {
+            emitLine("    push(tostring(pop()))");
+        }
+        return;
+    }
+    else if (funcName == "VAL") {
+        // VAL(s) converts string to number
+        if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+            auto argExpr = m_exprOptimizer.pop();
+            if (argExpr) {
+                m_exprOptimizer.pushVariable("tonumber(" + m_exprOptimizer.toString(argExpr) + ") or 0");
+            } else {
+                emitLine("    push(tonumber(pop()) or 0)");
+            }
+        } else {
+            emitLine("    push(tonumber(pop()) or 0)");
+        }
+        return;
+    }
+    else if (funcName == "LEFT_STRING" || funcName == "LEFT$" || funcName == "LEFT") {
+        // LEFT$(s, n) returns leftmost n characters
+        if (m_unicodeMode) {
+            if (canUseExpressionMode() && m_exprOptimizer.size() >= 2) {
+                auto lenExpr = m_exprOptimizer.pop();
+                auto strExpr = m_exprOptimizer.pop();
+                if (lenExpr && strExpr) {
+                    std::string result = "unicode.left(" + m_exprOptimizer.toString(strExpr) + ", " +
+                                        m_exprOptimizer.toString(lenExpr) + ")";
+                    m_exprOptimizer.pushVariable(result);
+                } else {
+                    emitLine("    b = pop(); a = pop(); push(unicode.left(a, b))");
+                }
+            } else {
+                emitLine("    b = pop(); a = pop(); push(unicode.left(a, b))");
+            }
+        } else {
+            if (canUseExpressionMode() && m_exprOptimizer.size() >= 2) {
+                auto lenExpr = m_exprOptimizer.pop();
+                auto strExpr = m_exprOptimizer.pop();
+                if (lenExpr && strExpr) {
+                    std::string result = "string.sub(" + m_exprOptimizer.toString(strExpr) + ", 1, " +
+                                        m_exprOptimizer.toString(lenExpr) + ")";
+                    m_exprOptimizer.pushVariable(result);
+                } else {
+                    emitLine("    b = pop(); a = pop(); push(string.sub(a, 1, b))");
+                }
+            } else {
+                emitLine("    b = pop(); a = pop(); push(string.sub(a, 1, b))");
+            }
+        }
+        return;
+    }
+    else if (funcName == "RIGHT_STRING" || funcName == "RIGHT$" || funcName == "RIGHT") {
+        // RIGHT$(s, n) returns rightmost n characters
+        if (m_unicodeMode) {
+            if (canUseExpressionMode() && m_exprOptimizer.size() >= 2) {
+                auto lenExpr = m_exprOptimizer.pop();
+                auto strExpr = m_exprOptimizer.pop();
+                if (lenExpr && strExpr) {
+                    std::string result = "unicode.right(" + m_exprOptimizer.toString(strExpr) + ", " +
+                                        m_exprOptimizer.toString(lenExpr) + ")";
+                    m_exprOptimizer.pushVariable(result);
+                } else {
+                    emitLine("    b = pop(); a = pop(); push(unicode.right(a, b))");
+                }
+            } else {
+                emitLine("    b = pop(); a = pop(); push(unicode.right(a, b))");
+            }
+        } else {
+            if (canUseExpressionMode() && m_exprOptimizer.size() >= 2) {
+                auto lenExpr = m_exprOptimizer.pop();
+                auto strExpr = m_exprOptimizer.pop();
+                if (lenExpr && strExpr) {
+                    std::string result = "string.sub(" + m_exprOptimizer.toString(strExpr) + ", -" +
+                                        m_exprOptimizer.toString(lenExpr) + ")";
+                    m_exprOptimizer.pushVariable(result);
+                } else {
+                    emitLine("    b = pop(); a = pop(); push(string.sub(a, -b))");
+                }
+            } else {
+                emitLine("    b = pop(); a = pop(); push(string.sub(a, -b))");
+            }
+        }
+        return;
+    }
+    else if (funcName == "MID_STRING" || funcName == "MID$" || funcName == "MID") {
+        // MID$(s, start, len) returns substring (BASIC uses 1-based indexing)
+        if (m_unicodeMode) {
+            if (canUseExpressionMode() && m_exprOptimizer.size() >= 3) {
+                auto lenExpr = m_exprOptimizer.pop();
+                auto startExpr = m_exprOptimizer.pop();
+                auto strExpr = m_exprOptimizer.pop();
+                if (lenExpr && startExpr && strExpr) {
+                    std::string result = "unicode.mid(" + m_exprOptimizer.toString(strExpr) + ", " +
+                                        m_exprOptimizer.toString(startExpr) + ", " +
+                                        m_exprOptimizer.toString(lenExpr) + ")";
+                    m_exprOptimizer.pushVariable(result);
+                } else {
+                    emitLine("    len = pop(); start = pop(); s = pop(); push(unicode.mid(s, start, len))");
+                }
+            } else {
+                emitLine("    len = pop(); start = pop(); s = pop(); push(unicode.mid(s, start, len))");
+            }
+        } else {
+            if (canUseExpressionMode() && m_exprOptimizer.size() >= 3) {
+                auto lenExpr = m_exprOptimizer.pop();
+                auto startExpr = m_exprOptimizer.pop();
+                auto strExpr = m_exprOptimizer.pop();
+                if (lenExpr && startExpr && strExpr) {
+                    std::string result = "string.sub(" + m_exprOptimizer.toString(strExpr) + ", " +
+                                        m_exprOptimizer.toString(startExpr) + ", " +
+                                        m_exprOptimizer.toString(startExpr) + " + " +
+                                        m_exprOptimizer.toString(lenExpr) + " - 1)";
+                    m_exprOptimizer.pushVariable(result);
+                } else {
+                    emitLine("    len = pop(); start = pop(); s = pop(); push(string.sub(s, start, start + len - 1))");
+                }
+            } else {
+                emitLine("    len = pop(); start = pop(); s = pop(); push(string.sub(s, start, start + len - 1))");
+            }
+        }
+        return;
+    }
+    else if (funcName == "INSTR") {
+        // INSTR can have 2 or 3 arguments:
+        // 2 args: INSTR(haystack$, needle$) - search from beginning
+        // 3 args: INSTR(start, haystack$, needle$) - search from position start
+        if (argCount == 3) {
+            // 3-argument version: INSTR(start, haystack$, needle$)
+            if (m_unicodeMode) {
+                if (canUseExpressionMode() && m_exprOptimizer.size() >= 3) {
+                    auto needleExpr = m_exprOptimizer.pop();
+                    auto haystackExpr = m_exprOptimizer.pop();
+                    auto startExpr = m_exprOptimizer.pop();
+                    if (needleExpr && haystackExpr && startExpr) {
+                        std::string result = "unicode.instr_start(" + m_exprOptimizer.toString(startExpr) + ", " +
+                                            m_exprOptimizer.toString(haystackExpr) + ", " +
+                                            m_exprOptimizer.toString(needleExpr) + ")";
+                        m_exprOptimizer.pushVariable(result);
+                    } else {
+                        emitLine("    c = pop(); b = pop(); a = pop(); push(unicode.instr_start(a, b, c))");
+                    }
+                } else {
+                    emitLine("    c = pop(); b = pop(); a = pop(); push(unicode.instr_start(a, b, c))");
+                }
+            } else {
+                if (canUseExpressionMode() && m_exprOptimizer.size() >= 3) {
+                    auto needleExpr = m_exprOptimizer.pop();
+                    auto haystackExpr = m_exprOptimizer.pop();
+                    auto startExpr = m_exprOptimizer.pop();
+                    if (needleExpr && haystackExpr && startExpr) {
+                        std::string result = "(string.find(" + m_exprOptimizer.toString(haystackExpr) + ", " +
+                                            m_exprOptimizer.toString(needleExpr) + ", " +
+                                            m_exprOptimizer.toString(startExpr) + ", true) or 0)";
+                        m_exprOptimizer.pushVariable(result);
+                    } else {
+                        emitLine("    c = pop(); b = pop(); a = pop(); push(string.find(b, c, a, true) or 0)");
+                    }
+                } else {
+                    emitLine("    c = pop(); b = pop(); a = pop(); push(string.find(b, c, a, true) or 0)");
+                }
+            }
+        } else {
+            // 2-argument version: INSTR(haystack$, needle$)
+            if (m_unicodeMode) {
+                if (canUseExpressionMode() && m_exprOptimizer.size() >= 2) {
+                    auto needleExpr = m_exprOptimizer.pop();
+                    auto haystackExpr = m_exprOptimizer.pop();
+                    if (needleExpr && haystackExpr) {
+                        std::string result = "unicode.instr(" + m_exprOptimizer.toString(haystackExpr) + ", " +
+                                            m_exprOptimizer.toString(needleExpr) + ")";
+                        m_exprOptimizer.pushVariable(result);
+                    } else {
+                        emitLine("    b = pop(); a = pop(); push(unicode.instr(a, b))");
+                    }
+                } else {
+                    emitLine("    b = pop(); a = pop(); push(unicode.instr(a, b))");
+                }
+            } else {
+                if (canUseExpressionMode() && m_exprOptimizer.size() >= 2) {
+                    auto needleExpr = m_exprOptimizer.pop();
+                    auto haystackExpr = m_exprOptimizer.pop();
+                    if (needleExpr && haystackExpr) {
+                        std::string result = "(string.find(" + m_exprOptimizer.toString(haystackExpr) + ", " +
+                                            m_exprOptimizer.toString(needleExpr) + ", 1, true) or 0)";
+                        m_exprOptimizer.pushVariable(result);
+                    } else {
+                        emitLine("    b = pop(); a = pop(); push(string.find(a, b, 1, true) or 0)");
+                    }
+                } else {
+                    emitLine("    b = pop(); a = pop(); push(string.find(a, b, 1, true) or 0)");
+                }
+            }
+        }
+        return;
+    }
+    else if (funcName == "STRING_STRING" || funcName == "STRING$" || funcName == "STRING") {
+        // STRING$(count, char$) or STRING$(count, ascii) returns repeated character
+        if (m_unicodeMode) {
+            if (canUseExpressionMode() && m_exprOptimizer.size() >= 2) {
+                auto charExpr = m_exprOptimizer.pop();
+                auto countExpr = m_exprOptimizer.pop();
+                if (charExpr && countExpr) {
+                    std::string charStr = m_exprOptimizer.toString(charExpr);
+                    std::string countStr = m_exprOptimizer.toString(countExpr);
+                    // Handle both table (codepoint array) and number: if number, use directly
+                    std::string result = "unicode.string_repeat(" + countStr + ", (type(" + charStr + ") == 'number' and " + charStr + " or unicode.asc(" + charStr + ")))";
+                    m_exprOptimizer.pushVariable(result);
+                } else {
+                    emitLine("    b = pop(); a = pop(); push(unicode.string_repeat(a, type(b) == 'number' and b or unicode.asc(b)))");
+                }
+            } else {
+                emitLine("    b = pop(); a = pop(); push(unicode.string_repeat(a, type(b) == 'number' and b or unicode.asc(b)))");
+            }
+        } else {
+            if (canUseExpressionMode() && m_exprOptimizer.size() >= 2) {
+                auto charExpr = m_exprOptimizer.pop();
+                auto countExpr = m_exprOptimizer.pop();
+                if (charExpr && countExpr) {
+                    std::string charStr = m_exprOptimizer.toString(charExpr);
+                    std::string countStr = m_exprOptimizer.toString(countExpr);
+                    // Handle both string and number: if number, convert to char
+                    std::string result = "string.rep((type(" + charStr + ") == 'number' and string.char(" + charStr + ") or string.sub(" + charStr + ", 1, 1)), " + countStr + ")";
+                    m_exprOptimizer.pushVariable(result);
+                } else {
+                    emitLine("    b = pop(); a = pop(); push(string.rep(type(b) == 'number' and string.char(b) or string.sub(b, 1, 1), a))");
+                }
+            } else {
+                emitLine("    b = pop(); a = pop(); push(string.rep(type(b) == 'number' and string.char(b) or string.sub(b, 1, 1), a))");
+            }
+        }
+        return;
+    }
+    else if (funcName == "SPACE_STRING" || funcName == "SPACE$" || funcName == "SPACE") {
+        // SPACE$(n) returns n spaces
+        if (m_unicodeMode) {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto countExpr = m_exprOptimizer.pop();
+                if (countExpr) {
+                    m_exprOptimizer.pushVariable("unicode.space(" + m_exprOptimizer.toString(countExpr) + ")");
+                } else {
+                    emitLine("    push(unicode.space(pop()))");
+                }
+            } else {
+                emitLine("    push(unicode.space(pop()))");
+            }
+        } else {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto countExpr = m_exprOptimizer.pop();
+                if (countExpr) {
+                    m_exprOptimizer.pushVariable("string.rep(' ', " + m_exprOptimizer.toString(countExpr) + ")");
+                } else {
+                    emitLine("    push(string.rep(' ', pop()))");
+                }
+            } else {
+                emitLine("    push(string.rep(' ', pop()))");
+            }
+        }
+        return;
+    }
+    else if (funcName == "LCASE_STRING" || funcName == "LCASE$" || funcName == "LCASE") {
+        // LCASE$(s) returns lowercase string
+        if (m_unicodeMode) {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto strExpr = m_exprOptimizer.pop();
+                if (strExpr) {
+                    m_exprOptimizer.pushVariable("unicode.lower(" + m_exprOptimizer.toString(strExpr) + ")");
+                } else {
+                    emitLine("    push(unicode.lower(pop()))");
+                }
+            } else {
+                emitLine("    push(unicode.lower(pop()))");
+            }
+        } else {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto strExpr = m_exprOptimizer.pop();
+                if (strExpr) {
+                    m_exprOptimizer.pushVariable("string.lower(" + m_exprOptimizer.toString(strExpr) + ")");
+                } else {
+                    emitLine("    push(string.lower(pop()))");
+                }
+            } else {
+                emitLine("    push(string.lower(pop()))");
+            }
+        }
+        return;
+    }
+    else if (funcName == "UCASE_STRING" || funcName == "UCASE$" || funcName == "UCASE") {
+        // UCASE$(s) returns uppercase string
+        if (m_unicodeMode) {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto strExpr = m_exprOptimizer.pop();
+                if (strExpr) {
+                    m_exprOptimizer.pushVariable("unicode.upper(" + m_exprOptimizer.toString(strExpr) + ")");
+                } else {
+                    emitLine("    push(unicode.upper(pop()))");
+                }
+            } else {
+                emitLine("    push(unicode.upper(pop()))");
+            }
+        } else {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto strExpr = m_exprOptimizer.pop();
+                if (strExpr) {
+                    m_exprOptimizer.pushVariable("string.upper(" + m_exprOptimizer.toString(strExpr) + ")");
+                } else {
+                    emitLine("    push(string.upper(pop()))");
+                }
+            } else {
+                emitLine("    push(string.upper(pop()))");
+            }
+        }
+        return;
+    }
+    else if (funcName == "LTRIM_STRING" || funcName == "LTRIM$" || funcName == "LTRIM") {
+        // LTRIM$(s) removes leading spaces
+        if (m_unicodeMode) {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto strExpr = m_exprOptimizer.pop();
+                if (strExpr) {
+                    m_exprOptimizer.pushVariable("unicode.ltrim(" + m_exprOptimizer.toString(strExpr) + ")");
+                } else {
+                    emitLine("    push(unicode.ltrim(pop()))");
+                }
+            } else {
+                emitLine("    push(unicode.ltrim(pop()))");
+            }
+        } else {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto strExpr = m_exprOptimizer.pop();
+                if (strExpr) {
+                    m_exprOptimizer.pushVariable("string.match(" + m_exprOptimizer.toString(strExpr) + ", '^%s*(.*)$')");
+                } else {
+                    emitLine("    push(string.match(pop(), '^%s*(.*)$'))");
+                }
+            } else {
+                emitLine("    push(string.match(pop(), '^%s*(.*)$'))");
+            }
+        }
+        return;
+    }
+    else if (funcName == "RTRIM_STRING" || funcName == "RTRIM$" || funcName == "RTRIM") {
+        // RTRIM$(s) removes trailing spaces
+        if (m_unicodeMode) {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto strExpr = m_exprOptimizer.pop();
+                if (strExpr) {
+                    m_exprOptimizer.pushVariable("unicode.rtrim(" + m_exprOptimizer.toString(strExpr) + ")");
+                } else {
+                    emitLine("    push(unicode.rtrim(pop()))");
+                }
+            } else {
+                emitLine("    push(unicode.rtrim(pop()))");
+            }
+        } else {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto strExpr = m_exprOptimizer.pop();
+                if (strExpr) {
+                    m_exprOptimizer.pushVariable("string.match(" + m_exprOptimizer.toString(strExpr) + ", '^(.-)%s*$')");
+                } else {
+                    emitLine("    push(string.match(pop(), '^(.-)%s*$'))");
+                }
+            } else {
+                emitLine("    push(string.match(pop(), '^(.-)%s*$'))");
+            }
+        }
+        return;
+    }
+    else if (funcName == "TRIM_STRING" || funcName == "TRIM$" || funcName == "TRIM") {
+        // TRIM$(s) removes leading and trailing spaces
+        if (m_unicodeMode) {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto strExpr = m_exprOptimizer.pop();
+                if (strExpr) {
+                    m_exprOptimizer.pushVariable("unicode.trim(" + m_exprOptimizer.toString(strExpr) + ")");
+                } else {
+                    emitLine("    push(unicode.trim(pop()))");
+                }
+            } else {
+                emitLine("    push(unicode.trim(pop()))");
+            }
+        } else {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto strExpr = m_exprOptimizer.pop();
+                if (strExpr) {
+                    m_exprOptimizer.pushVariable("string.match(" + m_exprOptimizer.toString(strExpr) + ", '^%s*(.-)%s*$')");
+                } else {
+                    emitLine("    push(string.match(pop(), '^%s*(.-)%s*$'))");
+                }
+            } else {
+                emitLine("    push(string.match(pop(), '^%s*(.-)%s*$'))");
+            }
+        }
+        return;
+    }
+    else if (funcName == "REVERSE_STRING" || funcName == "REVERSE$" || funcName == "REVERSE") {
+        // REVERSE$(s) reverses a string
+        if (m_unicodeMode) {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto strExpr = m_exprOptimizer.pop();
+                if (strExpr) {
+                    m_exprOptimizer.pushVariable("unicode.reverse(" + m_exprOptimizer.toString(strExpr) + ")");
+                } else {
+                    emitLine("    push(unicode.reverse(pop()))");
+                }
+            } else {
+                emitLine("    push(unicode.reverse(pop()))");
+            }
+        } else {
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto strExpr = m_exprOptimizer.pop();
+                if (strExpr) {
+                    m_exprOptimizer.pushVariable("string.reverse(" + m_exprOptimizer.toString(strExpr) + ")");
+                } else {
+                    emitLine("    push(string.reverse(pop()))");
+                }
+            } else {
+                emitLine("    push(string.reverse(pop()))");
+            }
+        }
+        return;
+    }
+
+    // RND is special - no arguments
+    else if (funcName == "RND") {
+        if (canUseExpressionMode()) {
+            m_exprOptimizer.pushVariable("basic_rnd()");
+        } else {
+            emitLine("    push(basic_rnd())");
+        }
+        return;
+    }
+
+    // Native Lua math functions handled above
+
+    // SuperTerminal API Commands (statements - no return value)
+    // High-res Graphics Layer commands - now handled by registry
+
+    // Screen control commands - now handled by registry
+    // Chunky Graphics commands - now handled by registry
+    // Text layer commands - now handled by registry
+
+    // Sprite commands - now handled by registry
+
+    // Audio commands - now handled by registry
+    if (funcName == "COLOR") {
+        flushExpressionToStack();
+        if (argCount == 2) {
+            emitLine("    local bg = pop(); local fg = pop()");
+            emitLine("    basic_color(fg, bg)");
+        } else if (argCount == 1) {
+            emitLine("    basic_color(pop(), -1)");
+        }
+        return;
+    } else if (funcName == "WIDTH") {
+        // WIDTH function returns terminal width
+        if (canUseExpressionMode()) {
+            m_exprOptimizer.pushVariable("screen_width()");
+        } else {
+            emitLine("    push(screen_width())");
+        }
+        return;
+    } else if (funcName == "HEIGHT") {
+        // HEIGHT function returns terminal height
+        if (canUseExpressionMode()) {
+            m_exprOptimizer.pushVariable("screen_height()");
+        } else {
+            emitLine("    push(screen_height())");
+        }
+        return;
+    }
+    // Music/Audio commands - now handled by registry
+    // Timing commands - now handled by registry
+    // Particle commands - now handled by registry
+
+    // === File I/O Functions ===
+    else if (funcName == "EOF") {
+        flushExpressionToStack();
+        emitLine("    local filenum = pop()");
+        emitLine("    push(basic_eof(filenum) and 1 or 0)");
+        return;
+    } else if (funcName == "LOC") {
+        flushExpressionToStack();
+        emitLine("    push(basic_loc(pop()))");
+        return;
+    } else if (funcName == "LOF") {
+        flushExpressionToStack();
+        emitLine("    push(basic_lof(pop()))");
+        return;
+    }
+
+    // Unknown builtin - emit warning
+    if (m_config.emitComments) {
+        emitComment("Unknown builtin: " + funcName);
+    }
+    // Fallback: try to call it anyway (might be graphics/text function)
+    // Name is already mangled in parser
+    if (argCount > 0) {
+        std::string args;
+        for (int i = 0; i < argCount; i++) {
+            if (i > 0) args = ", " + args;
+            args = "pop()" + args;
+        }
+        emitLine("    push(" + funcName + "(" + args + "))");
+    } else {
+        emitLine("    push(" + funcName + "())");
+    }
+}
+
+// =============================================================================
+// User-Defined Functions and Subroutines
+// =============================================================================
+
+void LuaCodeGenerator::emitFunctionDefinition(const IRInstruction& instr) {
+    std::string name;
+
+    // DEFINE_FUNCTION/DEFINE_SUB have operand1, but END_FUNCTION/END_SUB don't
+    if (instr.opcode == IROpcode::DEFINE_FUNCTION || instr.opcode == IROpcode::DEFINE_SUB) {
+        if (!std::holds_alternative<std::string>(instr.operand1)) return;
+        name = std::get<std::string>(instr.operand1);
+    }
+
+    switch (instr.opcode) {
+        case IROpcode::DEFINE_FUNCTION:
+        case IROpcode::DEFINE_SUB: {
+            // Flush any pending expressions before defining function
+            flushExpressionToStack();
+
+            bool isFunction = (instr.opcode == IROpcode::DEFINE_FUNCTION);
+
+            // Look up function definition info
+            auto it = m_functionDefs.find(name);
+            if (it != m_functionDefs.end()) {
+                m_currentFunction = &it->second;
+            }
+
+            // Begin function definition
+            emitLine("");
+            if (m_config.emitComments) {
+                emitComment((isFunction ? "FUNCTION " : "SUB ") + name);
+            }
+
+            // Build parameter list
+            std::string paramList = "";
+            if (m_currentFunction) {
+                for (size_t i = 0; i < m_currentFunction->parameters.size(); i++) {
+                    if (i > 0) paramList += ", ";
+                    paramList += getVarName(m_currentFunction->parameters[i]);
+                }
+            }
+
+            // Name is already mangled in parser
+            emitLine("local function func_" + name + "(" + paramList + ")");
+
+            break;
+        }
+
+        case IROpcode::END_FUNCTION:
+        case IROpcode::END_SUB: {
+            // Just close the function - no cleanup code here
+            // All RETURN statements handle SAMM exit_scope before returning
+            emitLine("end");
+            emitLine("");
+
+            m_currentFunction = nullptr;
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+void LuaCodeGenerator::emitFunctionCall(const IRInstruction& instr) {
+    if (!std::holds_alternative<std::string>(instr.operand1)) return;
+
+    std::string funcName = std::get<std::string>(instr.operand1);
+    int argCount = 0;
+
+    if (std::holds_alternative<int>(instr.operand2)) {
+        argCount = std::get<int>(instr.operand2);
+    }
+
+    bool isFunction = (instr.opcode == IROpcode::CALL_FUNCTION);
+
+    if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+        // Build arguments from expression optimizer
+        std::vector<std::string> args;
+        for (int i = 0; i < argCount; i++) {
+            auto argExpr = m_exprOptimizer.pop();
+            if (argExpr) {
+                args.insert(args.begin(), m_exprOptimizer.toString(argExpr));
+            } else {
+                args.insert(args.begin(), "nil");
+            }
+        }
+
+        // Check if this is an external API function (SuperTerminal APIs)
+        // External functions are all uppercase with underscores
+        // Also treat graphics commands as built-in (RECT, CIRCLE, etc.)
+        bool isExternalFunc = false;
+        if (funcName == "RECT" || funcName == "CIRCLEF" ||
+            funcName == "CIRCLE" || funcName == "LINE" || funcName == "PSET" ||
+            funcName == "CLS" || funcName == "WAIT_FRAME" || funcName == "WAIT_MS") {
+            isExternalFunc = true;
+        } else if (!funcName.empty() && funcName.find('_') != std::string::npos) {
+            // Check if all chars are uppercase, digits, or underscores
+            isExternalFunc = true;
+            for (char c : funcName) {
+                if (!(std::isupper(c) || std::isdigit(c) || c == '_')) {
+                    isExternalFunc = false;
+                    break;
+                }
+            }
+        }
+
+        // Build function call expression (name already mangled in parser)
+        std::string prefix = isExternalFunc ? "" : "func_";
+        std::string actualFuncName = funcName;
+        // Convert external functions to lowercase (they're registered that way in Lua)
+        // Graphics commands map to gfx_* functions
+        if (isExternalFunc) {
+            if (funcName == "RECT") {
+                actualFuncName = "gfx_rect_outline";
+            } else if (funcName == "CIRCLEF") {
+                actualFuncName = "gfx_circle";
+            } else if (funcName == "CIRCLE") {
+                actualFuncName = "gfx_circle_outline";
+            } else if (funcName == "LINE") {
+                actualFuncName = "gfx_line";
+            } else if (funcName == "PSET") {
+                actualFuncName = "gfx_point";
+            } else if (funcName == "CLS") {
+                actualFuncName = "text_clear";
+            } else if (funcName == "WAIT_FRAME") {
+                actualFuncName = "wait_frame";
+            } else if (funcName == "WAIT_MS") {
+                actualFuncName = "wait_ms";
+            } else {
+                std::transform(actualFuncName.begin(), actualFuncName.end(), actualFuncName.begin(), ::tolower);
+            }
+        }
+        std::string callExpr = prefix + actualFuncName + "(";
+        for (size_t i = 0; i < args.size(); i++) {
+            if (i > 0) callExpr += ", ";
+            callExpr += args[i];
+        }
+        callExpr += ")";
+
+        if (isFunction) {
+            // Function call - push result
+            m_exprOptimizer.pushVariable(callExpr);
+        } else {
+            // SUB call - just execute, no return value
+            flushExpressionToStack();
+            emitLine("    " + callExpr);
+        }
+    } else {
+        // Stack-based mode
+        flushExpressionToStack();
+
+        // Pop arguments in reverse order
+        std::vector<std::string> args;
+        for (int i = 0; i < argCount; i++) {
+            args.insert(args.begin(), popExpr());
+        }
+
+        // Check if this is an external API function (SuperTerminal APIs)
+        // External functions are all uppercase with underscores
+        // Also treat graphics commands as built-in (RECT, CIRCLE, etc.)
+        bool isExternalFunc = false;
+        if (funcName == "RECT" || funcName == "CIRCLEF" ||
+            funcName == "CIRCLE" || funcName == "LINE" || funcName == "PSET" ||
+            funcName == "CLS" || funcName == "WAIT_FRAME" || funcName == "WAIT_MS") {
+            isExternalFunc = true;
+        } else if (!funcName.empty() && funcName.find('_') != std::string::npos) {
+            // Check if all chars are uppercase, digits, or underscores
+            isExternalFunc = true;
+            for (char c : funcName) {
+                if (!(std::isupper(c) || std::isdigit(c) || c == '_')) {
+                    isExternalFunc = false;
+                    break;
+                }
+            }
+        }
+
+        // Build function call (name already mangled in parser)
+        std::string prefix = isExternalFunc ? "" : "func_";
+        std::string actualFuncName = funcName;
+        // Convert external functions to lowercase (they're registered that way in Lua)
+        // Graphics commands map to gfx_* functions
+        if (isExternalFunc) {
+            if (funcName == "RECT") {
+                actualFuncName = "gfx_rect_outline";
+            } else if (funcName == "CIRCLE") {
+                actualFuncName = "gfx_circle_outline";
+            } else if (funcName == "CIRCLEF") {
+                actualFuncName = "gfx_circle";
+            } else if (funcName == "LINE") {
+                actualFuncName = "gfx_line";
+            } else if (funcName == "PSET") {
+                actualFuncName = "gfx_point";
+            } else if (funcName == "CLS") {
+                actualFuncName = "text_clear";
+            } else if (funcName == "WAIT_FRAME") {
+                actualFuncName = "wait_frame";
+            } else if (funcName == "WAIT_MS") {
+                actualFuncName = "wait_ms";
+            } else {
+                std::transform(actualFuncName.begin(), actualFuncName.end(), actualFuncName.begin(), ::tolower);
+            }
+        }
+        std::string callExpr = prefix + actualFuncName + "(";
+        for (size_t i = 0; i < args.size(); i++) {
+            if (i > 0) callExpr += ", ";
+            callExpr += args[i];
+        }
+        callExpr += ")";
+
+        if (isFunction) {
+            // Function call - push result
+            emitLine("    push(" + callExpr + ")");
+        } else {
+            // SUB call - just execute
+            emitLine("    " + callExpr);
+        }
+    }
+}
+
+void LuaCodeGenerator::emitExit(const IRInstruction& instr) {
+    flushExpressionToStack();
+
+    switch (instr.opcode) {
+        case IROpcode::EXIT_FOR:
+        case IROpcode::EXIT_DO:
+        case IROpcode::EXIT_WHILE:
+        case IROpcode::EXIT_REPEAT: {
+            // Exit from loop - emit break statement
+            emitLine("    break");
+            break;
+        }
+
+        case IROpcode::EXIT_FUNCTION: {
+            // Exit from FUNCTION - return with current function result variable
+            if (m_currentFunction) {
+                std::string funcName = mangleName(m_currentFunction->name);
+                if (m_config.useLuaJITHints) {
+                    emitLine("    if samm then samm.exit_scope() end");
+                }
+                emitLine("    return " + funcName);
+            } else {
+                emitLine("    return");
+            }
+            break;
+        }
+
+        case IROpcode::EXIT_SUB: {
+            // Exit from SUB - return without value
+
+            emitLine("    return");
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+void LuaCodeGenerator::emitReturn(const IRInstruction& instr) {
+    switch (instr.opcode) {
+        case IROpcode::RETURN_VALUE: {
+            // Return with value (for FUNCTION)
+            // Must promote return value to parent scope, then exit current scope
+            if (canUseExpressionMode() && !m_exprOptimizer.isEmpty()) {
+                auto returnExpr = m_exprOptimizer.pop();
+                if (returnExpr) {
+                    std::string returnValue = m_exprOptimizer.toString(returnExpr);
+                    emitLine("    return " + returnValue);
+                } else {
+                    flushExpressionToStack();
+                    std::string val = popExpr();
+                    emitLine("    return " + val);
+                }
+            } else {
+                flushExpressionToStack();
+                std::string val = popExpr();
+                emitLine("    return " + val);
+            }
+            break;
+        }
+
+        case IROpcode::RETURN_VOID: {
+            // Return without value (for SUB)
+            flushExpressionToStack();
+            emitLine("    return");
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+void LuaCodeGenerator::emit(const std::string& code) {
+    m_output << code;
+}
+
+void LuaCodeGenerator::emitLine(const std::string& code) {
+    // Apply indentation offset for nested contexts (e.g., subroutines)
+    if (m_indentOffset > 0 && !code.empty()) {
+        m_output << std::string(m_indentOffset, ' ') << code << "\n";
+    } else {
+        m_output << code << "\n";
+    }
+    m_stats.linesGenerated++;
+}
+
+void LuaCodeGenerator::emitComment(const std::string& comment) {
+    if (m_config.emitComments) {
+        emitLine("    -- " + comment);
+    }
+}
+
+void LuaCodeGenerator::emitLabel(const std::string& label) {
+    emitLine("    ::" + getLabelName(label) + "::");
+}
+
+std::string LuaCodeGenerator::getVarName(const std::string& name) {
+    // Convert BASIC variable name to valid Lua identifier
+    std::string luaName = "var_" + name;
+    // Replace invalid characters (like $ % # !) with underscore
+    for (char& c : luaName) {
+        if (!isalnum(c) && c != '_') {
+            c = '_';
+        }
+    }
+    return luaName;
+}
+
+std::string LuaCodeGenerator::getArrayName(const std::string& name) {
+    std::string luaName = "arr_" + name;
+    for (char& c : luaName) {
+        if (!isalnum(c) && c != '_') {
+            c = '_';
+        }
+    }
+    return luaName;
+}
+
+std::string LuaCodeGenerator::getLabelName(const std::string& label) {
+    std::string luaName = "label_" + label;
+    for (char& c : luaName) {
+        if (!isalnum(c) && c != '_') {
+            c = '_';
+        }
+    }
+    return luaName;
+}
+
+std::string LuaCodeGenerator::escapeString(const std::string& str) {
+    std::ostringstream oss;
+
+    // In OPTION UNICODE mode, wrap string literals with unicode.from_utf8()
+    if (m_unicodeMode) {
+        oss << "unicode.from_utf8(\"";
+    } else {
+        oss << "\"";
+    }
+
+    for (char c : str) {
+        switch (c) {
+            case '"': oss << "\\\""; break;
+            case '\\': oss << "\\\\"; break;
+            case '\n': oss << "\\n"; break;
+            case '\r': oss << "\\r"; break;
+            case '\t': oss << "\\t"; break;
+            default: oss << c; break;
+        }
+    }
+
+    if (m_unicodeMode) {
+        oss << "\")";
+    } else {
+        oss << "\"";
+    }
+
+    return oss.str();
+}
+
+void LuaCodeGenerator::emitStringConcat(const IRInstruction& instr) {
+    // String concatenation: pop 2 strings, push concatenation
+    // Check IR opcode to determine which type of concat
+    bool isUnicode = (instr.opcode == IROpcode::UNICODE_CONCAT);
+
+    if (isUnicode) {
+        // Unicode mode: use unicode.concat()
+        if (canUseExpressionMode() && m_exprOptimizer.size() >= 2) {
+            auto rightExpr = m_exprOptimizer.pop();
+            auto leftExpr = m_exprOptimizer.pop();
+            if (rightExpr && leftExpr) {
+                std::string result = "unicode.concat(" + m_exprOptimizer.toString(leftExpr) + ", " +
+                                    m_exprOptimizer.toString(rightExpr) + ")";
+                m_exprOptimizer.pushVariable(result);
+            } else {
+                emitLine("    b = pop(); a = pop(); push(unicode.concat(a, b))");
+            }
+        } else {
+            emitLine("    b = pop(); a = pop(); push(unicode.concat(a, b))");
+        }
+    } else {
+        // Standard mode: use Lua's .. operator
+        if (canUseExpressionMode() && m_exprOptimizer.size() >= 2) {
+            auto rightExpr = m_exprOptimizer.pop();
+            auto leftExpr = m_exprOptimizer.pop();
+            if (rightExpr && leftExpr) {
+                std::string result = "(" + m_exprOptimizer.toString(leftExpr) + " .. " +
+                                    m_exprOptimizer.toString(rightExpr) + ")";
+                m_exprOptimizer.pushVariable(result);
+            } else {
+                emitLine("    b = pop(); a = pop(); push(a .. b)");
+            }
+        } else {
+            emitLine("    b = pop(); a = pop(); push(a .. b)");
+        }
+    }
+}
+
+std::string LuaCodeGenerator::popExpr() {
+    if (m_exprStack.empty()) {
+        return "pop()";
+    }
+    auto entry = m_exprStack.back();
+    m_exprStack.pop_back();
+    return entry.expr;
+}
+
+void LuaCodeGenerator::pushExpr(const std::string& expr, bool isTemp) {
+    m_exprStack.push_back({expr, isTemp});
+}
+
+std::string LuaCodeGenerator::allocTemp() {
+    return "temp_" + std::to_string(m_tempVarCounter++);
+}
+
+void LuaCodeGenerator::freeTemp(const std::string& temp) {
+    // Could track temp variable pool here
+}
+
+// =============================================================================
+// Expression Optimizer Helpers
+// =============================================================================
+
+bool LuaCodeGenerator::canUseExpressionMode() const {
+    // We can use expression mode if:
+    // 1. Expression mode is enabled
+    // 2. We're not in a complex control flow situation
+    // 3. The expression optimizer doesn't have side effects
+    return m_useExpressionMode;
+}
+
+void LuaCodeGenerator::flushExpressionToStack() {
+    // If we have expressions in the optimizer, we need to emit them as stack operations
+    // Important: Collect all expressions first, then emit in reverse order to preserve stack order
+    std::vector<std::shared_ptr<Expr>> exprs;
+    while (!m_exprOptimizer.isEmpty()) {
+        auto expr = m_exprOptimizer.pop();
+        if (expr) {
+            exprs.push_back(expr);
+        }
+    }
+
+    // Emit in reverse order (bottom to top of original stack)
+    for (auto it = exprs.rbegin(); it != exprs.rend(); ++it) {
+        std::string code = m_exprOptimizer.toString(*it);
+        emitLine("    push(" + code + ")");
+    }
+}
+
+// =============================================================================
+// Variable Access Analysis and Hot/Cold Caching
+// =============================================================================
+
+void LuaCodeGenerator::analyzeVariableAccess(const IRCode& irCode) {
+    // First pass: count variable accesses and identify loop counters
+    std::unordered_set<std::string> loopCounters;
+
+    for (size_t i = 0; i < irCode.instructions.size(); i++) {
+        const auto& instr = irCode.instructions[i];
+
+        // Track FOR loop counters as always hot
+        if (instr.opcode == IROpcode::FOR_INIT) {
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                std::string varName = std::get<std::string>(instr.operand1);
+                loopCounters.insert(varName);
+                m_variableAccess[varName].isLoopCounter = true;
+            }
+        }
+
+        // Count LOAD_VAR and STORE_VAR accesses
+        if (instr.opcode == IROpcode::LOAD_VAR || instr.opcode == IROpcode::STORE_VAR) {
+            if (std::holds_alternative<std::string>(instr.operand1)) {
+                std::string varName = std::get<std::string>(instr.operand1);
+                m_variableAccess[varName].name = varName;
+                m_variableAccess[varName].accessCount++;
+            }
+        }
+
+        // Track variables used in INPUT operations (operand2 is the variable name)
+        if (instr.opcode == IROpcode::INPUT || instr.opcode == IROpcode::INPUT_FILE ||
+            instr.opcode == IROpcode::LINE_INPUT_FILE || instr.opcode == IROpcode::INPUT_AT) {
+            if (std::holds_alternative<std::string>(instr.operand2)) {
+                std::string varName = std::get<std::string>(instr.operand2);
+                m_variableAccess[varName].name = varName;
+                m_variableAccess[varName].accessCount++;
+            } else if (std::holds_alternative<std::string>(instr.operand1)) {
+                // For INPUT (non-file), the variable is in operand1
+                if (instr.opcode == IROpcode::INPUT) {
+                    std::string varName = std::get<std::string>(instr.operand1);
+                    m_variableAccess[varName].name = varName;
+                    m_variableAccess[varName].accessCount++;
+                }
+            }
+        }
+    }
+}
+
+void LuaCodeGenerator::selectHotVariables() {
+    // Build list of candidates sorted by access count
+    std::vector<std::pair<std::string, int>> candidates;
+
+    for (const auto& pair : m_variableAccess) {
+        const auto& info = pair.second;
+        // Loop counters and frequently accessed vars are candidates
+        if (info.isLoopCounter || info.accessCount > 1) {
+            candidates.push_back({info.name, info.accessCount});
+        }
+    }
+
+    // Sort by access count (descending)
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    // Select top N as hot variables (respecting maxLocalVariables limit)
+    int availableSlots = m_config.maxLocalVariables - m_usedLocalSlots;
+    int hotCount = std::min(availableSlots, (int)candidates.size());
+
+    for (int i = 0; i < hotCount; i++) {
+        const std::string& varName = candidates[i].first;
+        m_hotVariables.push_back(varName);
+        m_variableAccess[varName].isHot = true;
+    }
+
+    m_usedLocalSlots += hotCount;
+
+    // Assign integer IDs to cold variables for fast array access
+    m_coldVariableIDs.clear();
+    int nextColdID = 0;
+    for (const auto& pair : m_variableAccess) {
+        const std::string& varName = pair.first;
+        if (!pair.second.isHot) {
+            m_coldVariableIDs[varName] = nextColdID++;
+        }
+    }
+}
+
+bool LuaCodeGenerator::isHotVariable(const std::string& varName) {
+    if (!m_config.useVariableCache) return true; // All locals if not caching
+
+    // Function parameters are always hot (they're already function-local)
+    if (m_currentFunction != nullptr) {
+        for (const auto& param : m_currentFunction->parameters) {
+            if (param == varName) {
+                return true; // Parameters are always hot
+            }
+        }
+    }
+
+    auto it = m_variableAccess.find(varName);
+    if (it != m_variableAccess.end()) {
+        return it->second.isHot;
+    }
+    return false; // Unknown variables go to cold storage
+}
+
+std::string LuaCodeGenerator::getVariableReference(const std::string& varName) {
+    if (!m_config.useVariableCache) {
+        return getVarName(varName); // Original behavior
+    }
+
+    if (isHotVariable(varName)) {
+        return getVarName(varName); // Local variable (fast)
+    } else {
+        // Use integer-indexed array (much faster than hash table)
+        auto it = m_coldVariableIDs.find(varName);
+        if (it != m_coldVariableIDs.end()) {
+            return "vars[" + std::to_string(it->second) + "]"; // Array access: ~2-3 cycles
+        } else {
+            // Fallback for unknown variables (shouldn't happen)
+            return "vars." + getVarName(varName); // Hash table: ~20 cycles
+        }
+    }
+}
+
+void LuaCodeGenerator::emitVariableTableDeclaration() {
+    if (m_hotVariables.empty() && m_variableAccess.empty()) {
+        return; // No variables to manage
+    }
+
+    emitLine("-- Hot variables (frequently accessed) cached as locals");
+    if (!m_hotVariables.empty()) {
+        // Declare all hot variables
+        std::string hotDecl = "local ";
+        for (size_t i = 0; i < m_hotVariables.size(); i++) {
+            if (i > 0) hotDecl += ", ";
+            hotDecl += getVarName(m_hotVariables[i]);
+        }
+        emitLine(hotDecl);
+
+        // Initialize all hot variables to 0
+        for (const auto& varName : m_hotVariables) {
+            emitLine(getVarName(varName) + " = 0");
+        }
+    }
+
+    // Emit cold variable storage (array-based for performance)
+    if (m_variableAccess.size() > m_hotVariables.size()) {
+        emitLine("-- Cold variables stored in array (unlimited capacity)");
+        emitLine("local vars = {}");
+    }
+}
+
+void LuaCodeGenerator::emitParameterPoolDeclaration() {
+    emitLine("-- Parameter pool for modular commands (reduces local variable usage)");
+    emitLine("-- Pool supports up to 20 parameters per command");
+    emitLine("local param0, param1, param2, param3, param4, param5, param6, param7, param8, param9");
+    emitLine("local param10, param11, param12, param13, param14, param15, param16, param17, param18, param19");
+    emitLine("");
+}
+
+} // namespace FasterBASIC
